@@ -18,6 +18,8 @@ void output_scale_screen(double sw, double sh, int iw, int ih, OutScale *o);
 // The upscaler (Video > Upscaler): whether this build has it (UPSCALE_*), a quality mode's factor (UPQ_*: render size
 // = window / factor per axis), and the factor in use (1: Off)
 bool upscaler_available(int u);
+// The world camera's projection as last made (rt_persp, game thread): tan(fovy / 2), aspect, near, far; zeros before
+void rt_world_projection(float out[4]);
 bool upscale_modes_available(void);  // (rendering below the window's size: needs render-target scaling)
 double upscale_mode_factor(int q);
 double upscale_factor(void);

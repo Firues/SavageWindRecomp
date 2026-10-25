@@ -63,6 +63,7 @@ double upscale_factor(void) {
 // The window's shape over 16:9 while the game's views are widened to fill it, else 1; the field of view's factor in
 // use (rt_persp)
 static volatile float g_view_shape = 1, g_fov = 1;
+static uint32_t g_world_proj[4];  // tan(fovy / 2), aspect, near, far of the world camera's last matrix (rt_persp), float bits
 
 void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
     double fit = fmin(dw / 1920.0, dh / 1080.0);
@@ -214,6 +215,18 @@ void rt_persp(uint64_t proj, uint32_t *tan_fovy, uint32_t *aspect) {
         wide_cam[k].wrote_t = *tan_fovy, wide_cam[k].wrote_a = *aspect;
         pthread_mutex_unlock(&wide_cam_lock);
     }
+    if (nf[1] > 10001) {  // the world camera's projection as made (vulkan/mvec.c checks the scene's matrices with it)
+        float w[4] = {t, a, nf[0], nf[1]};
+        uint32_t u[4];
+        memcpy(u, w, sizeof u);
+        for (int i = 0; i < 4; i++) __atomic_store_n(&g_world_proj[i], u[i], __ATOMIC_RELAXED);
+    }
+}
+
+void rt_world_projection(float out[4]) {
+    uint32_t u[4];
+    for (int i = 0; i < 4; i++) u[i] = __atomic_load_n(&g_world_proj[i], __ATOMIC_RELAXED);
+    memcpy(out, u, sizeof u);
 }
 
 // The game's frustum views (tools/patches.py _frustum_load: sead's FrustumProjection; left, right at +0xa8 / +0xac,

@@ -15,10 +15,12 @@
 // remaining draws get no motion) and the slot is grown before its next use.
 // SAVAGEWIND_MVEC=1: on (off by default while this is being built). SAVAGEWIND_MVEC_LOG=<frames>: statistics every
 // that many frames (default 240).
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../../rt.h"
+#include "../output_scale.h"
 #include "mvec.h"
 
 #define MVEC_SLOTS 5
@@ -38,6 +40,7 @@ typedef struct {
     MvecRec *rec;
     int nrec, cap_rec;
     bool full;
+    MvecCamera cam;  // (camera_finish, once the frame is recorded)
 } Slot;
 
 static Slot slots[MVEC_SLOTS];
@@ -48,8 +51,93 @@ static Index prev_index[INDEX], ord_index[INDEX];
 
 static struct {  // since the last log line
     uint64_t frames, draws, matched, repeated, unmatched, dropped, cb_bytes, inst_bytes, copied, dedupe_hits, max_used, motion,
-        unchanged;  // motion draws whose previous constants are the same bytes as the current ones
+        unchanged,  // motion draws whose previous constants are the same bytes as the current ones
+        cameras;    // frames with a valid camera (camera_finish)
 } stat;
+// The frame's slot-3 copies by guest address (the camera block: the one most draws read, camera_finish)
+#define CAMC 32
+static struct { uint64_t addr; uint32_t off, size, n; } camc[CAMC];
+static int ncamc;
+
+static void mat4_mul(const float *a, const float *b, float *o) {  // row-major: o = a * b
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) o[r * 4 + c] = a[r * 4] * b[c] + a[r * 4 + 1] * b[4 + c] + a[r * 4 + 2] * b[8 + c] + a[r * 4 + 3] * b[12 + c];
+}
+
+// Inverse of a 4x4 (row-major), by cofactors; false when singular
+static bool mat4_inverse(const float *m, float *o) {
+    float a[16];
+    a[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    a[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    a[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    a[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    a[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    a[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    a[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    a[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    a[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    a[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    a[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    a[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    a[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    a[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    a[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    a[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    double det = (double)m[0] * a[0] + (double)m[1] * a[4] + (double)m[2] * a[8] + (double)m[3] * a[12];
+    if (fabs(det) < 1e-30) return false;
+    for (int i = 0; i < 16; i++) o[i] = (float)(a[i] / det);
+    return true;
+}
+
+// Whether a camera block's view and projection look like the world camera: a rigid view, and a perspective projection
+// with the world camera's field of view and aspect (rt_world_projection; 2%: the field of view can ease between the
+// frame that made the block and the last matrix) and (0, 0, -1, 0) as its last row. Its other entries are left free:
+// the near plane moves, and an offset (the jitter) may be in [0][2] / [1][2].
+static bool camera_plausible(const MvecCamera *c) {
+    for (int r = 0; r < 3; r++) {
+        const float *a = &c->view[r * 4];
+        if (fabsf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2] - 1) > 0.01f) return false;
+        for (int q = r + 1; q < 3; q++) {
+            const float *b = &c->view[q * 4];
+            if (fabsf(a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) > 0.01f) return false;
+        }
+    }
+    const float *p = c->proj;
+    if (p[12] != 0 || p[13] != 0 || p[14] != -1 || p[15] != 0 || p[1] != 0 || p[4] != 0) return false;
+    float w[4];
+    rt_world_projection(w);
+    if (w[0] <= 0 || w[1] <= 0) return false;
+    return fabsf(p[5] * w[0] - 1) < 0.02f && fabsf(p[0] * w[0] * w[1] - 1) < 0.02f;
+}
+
+// The finished frame's camera, from its camera block's copy in the slot's history
+static void camera_finish(Slot *s) {
+    MvecCamera *c = &s->cam;
+    c->valid = false;
+    int best = -1;
+    for (int i = 0; i < ncamc; i++) if (best < 0 || camc[i].n > camc[best].n) best = i;
+    ncamc = 0;
+    if (best < 0 || camc[best].size < 11 * 16) return;
+    float rows[11 * 4];
+    memcpy(rows, s->ptr + camc[best].off, sizeof rows);  // (write-combined memory: one read of 176 bytes)
+    memcpy(c->view, rows, 12 * 4);
+    memcpy(c->proj, rows + 7 * 4, 16 * 4);
+    float v4[16];
+    memcpy(v4, c->view, 12 * 4);
+    v4[12] = v4[13] = v4[14] = 0, v4[15] = 1;
+    mat4_mul(c->proj, v4, c->vp);
+    static bool warned;
+    if (!camera_plausible(c) || !mat4_inverse(c->vp, c->inv_vp)) {
+        if (!warned) LOG("[mvec] frame %llu: the scene camera block (%llx, %u draws) is not the world camera's view and "
+                         "projection: no camera vectors\n", (unsigned long long)s->frame, (unsigned long long)camc[best].addr,
+                         camc[best].n);
+        warned = true;
+        return;
+    }
+    c->valid = true;
+    stat.cameras++;
+}
+
 
 bool mvec_enabled(void) {
     static int on = -1;
@@ -88,16 +176,18 @@ static void log_stats(uint64_t frame) {
     LOG("[mvec] frame %llu: %.0f scene draws a frame, matched %.1f%% (%.0f with a repeated key, %.1f%% drawn with motion), "
         "unmatched %.0f, "
         "not recorded %.0f; inputs %.0f KB constants + %.0f KB instance data a frame, %.0f KB copied (%.0f copies "
-        "shared); history slot at most %.1f MB used of %.1f; %.1f%% of the motion draws with unchanged constants\n",
+        "shared); history slot at most %.1f MB used of %.1f; %.1f%% of the motion draws with unchanged constants; camera "
+        "found in %.0f%% of the frames\n",
         (unsigned long long)frame, stat.draws / f, stat.draws ? 100.0 * stat.matched / stat.draws : 0.0, stat.repeated / f,
         stat.draws ? 100.0 * stat.motion / stat.draws : 0.0, stat.unmatched / f, stat.dropped / f, stat.cb_bytes / f / 1024, stat.inst_bytes / f / 1024, stat.copied / f / 1024,
         stat.dedupe_hits / f, stat.max_used / 1048576.0, cur >= 0 ? slots[cur].cap / 1048576.0 : 0.0,
-        stat.motion ? 100.0 * stat.unchanged / stat.motion : 0.0);
+        stat.motion ? 100.0 * stat.unchanged / stat.motion : 0.0, 100.0 * stat.cameras / f);
     memset(&stat, 0, sizeof stat);
 }
 
 // A new presented frame: the slot it records into, the previous frame's index
 static void frame_begin(uint64_t frame) {
+    if (cur >= 0) camera_finish(&slots[cur]);
     if (cur >= 0) {
         if (slots[cur].used > stat.max_used) stat.max_used = slots[cur].used;
         log_stats(frame);
@@ -199,6 +289,12 @@ int mvec_record(const MvecDrawIn *d) {
         if (!d->cb[k].addr || !d->cb[k].size) continue;
         uint32_t off = copy_in(d->cb[k].addr, d->cb[k].size, d->gen, true);
         if (off == UINT32_MAX) goto full;
+        if (d->cb[k].slot == 3) {  // (camera block candidates: camera_finish)
+            int i = 0;
+            while (i < ncamc && camc[i].addr != d->cb[k].addr) i++;
+            if (i == ncamc && ncamc < CAMC) camc[ncamc++] = (typeof(camc[0])){d->cb[k].addr, off, (uint32_t)d->cb[k].size, 0};
+            if (i < ncamc) camc[i].n++;
+        }
         r->cb_slot[r->ncb] = d->cb[k].slot;
         r->cb_off[r->ncb] = off;
         r->cb_size[r->ncb++] = (uint32_t)d->cb[k].size;
@@ -256,6 +352,12 @@ float mvec_view_enabled(void) {
         px = e ? (atof(e) != 0 ? (float)atof(e) : 16.0f) : 0.0f;
     }
     return px;
+}
+
+const MvecCamera *mvec_camera(bool previous) {
+    int i = previous ? prev : -1;  // (the frame being recorded has no camera yet: the previous one and the one before)
+    if (!previous && prev >= 0) i = (prev + MVEC_SLOTS - 1) % MVEC_SLOTS;
+    return i >= 0 && slots[i].cam.valid ? &slots[i].cam : NULL;
 }
 
 const MvecRec *mvec_records(bool previous, int *n, VkBuffer *history) {

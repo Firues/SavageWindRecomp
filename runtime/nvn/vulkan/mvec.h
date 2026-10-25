@@ -49,6 +49,14 @@ bool mvec_enabled(void);  // SAVAGEWIND_MVEC=1
 // Records a scene draw of the current frame: its index among the frame's records, -1 when not recorded (off, or the
 // history buffer is full: grown for the next frame).
 int mvec_record(const MvecDrawIn *d);
+// A frame's camera, from its scene camera block (the constant buffer at slot 3 that most scene draws share; the scene
+// shaders make clip = proj * view * position): the view (rows 0-2, a rigid 3x4) and the projection (rows 7-10, an
+// OpenGL-style 4x4, its near plane moving with the camera's distance), row-major as the shaders read them; vp = proj *
+// view and its inverse. valid: found and checked against the world camera's projection (rt_world_projection).
+typedef struct { float view[12], proj[16], vp[16], inv_vp[16]; bool valid; } MvecCamera;
+// The camera of the previous frame (previous) or of the one before it, once its draws are all recorded
+const MvecCamera *mvec_camera(bool previous);
+
 // The current and the previous frame's records and history buffers (NULL / 0 when there is no previous frame)
 const MvecRec *mvec_records(bool previous, int *n, VkBuffer *history);
 // The push constants of the current frame's record `rec` (mvec_record's index): its match's constant buffer copies in
