@@ -243,7 +243,7 @@ void rt_frustum(uint64_t proj, float *f) {
     f[0] = c + (lr[0] - c) * shape, f[1] = c + (lr[1] - c) * shape;
 }
 
-// Temporal anti-aliasing / upscaling jitter (SAVAGEWIND_JITTER=1): the world camera's projection moved by a sub-pixel
+// Temporal anti-aliasing / upscaling jitter (Video > Anti-aliasing TAA; SAVAGEWIND_JITTER=1 / 0 whatever the setting): the world camera's projection moved by a sub-pixel
 // offset, a Halton (2, 3) sequence over 8 game frames (framepace_game_frame: every matrix made in one frame gets the
 // same), [-0.5, 0.5] pixels of the scene's render size (rt_jitter_set_size). It lands in the projection of the frame's
 // camera block, where vulkan/mvec.c reads it back and takes it out of the motion vectors.
@@ -254,9 +254,33 @@ void rt_jitter_set_size(uint32_t w, uint32_t h) {
 }
 
 bool rt_jitter_on(void) {
-    static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_JITTER") && atoi(getenv("SAVAGEWIND_JITTER")) != 0;
-    return on;
+    static int env = -2;
+    if (env == -2) env = getenv("SAVAGEWIND_JITTER") ? atoi(getenv("SAVAGEWIND_JITTER")) != 0 : -1;
+    return env >= 0 ? env : rt_antialias() == AA_TAA;
+}
+
+// Video > Anti-aliasing (settings.h AA_*). Test override: SAVAGEWIND_AA_AT=<frame>:<off|smaa|taa>,... from that
+// presented frame on (same-view A/B in one run).
+uint64_t renderer_present_count(void);
+int rt_antialias(void) {
+    static int n = -1;
+    static unsigned long long at[8];
+    static int mode[8];
+    if (n < 0) {
+        n = 0;
+        for (const char *e = getenv("SAVAGEWIND_AA_AT"); e && *e && n < 8;) {
+            char name[16] = "";
+            if (sscanf(e, "%llu:%15[^,]", &at[n], name) != 2) break;
+            mode[n++] = !strcmp(name, "taa") ? AA_TAA : !strcmp(name, "smaa") ? AA_SMAA : AA_OFF;
+            e = strchr(e, ',');
+            if (e) e++;
+        }
+    }
+    int r = g_settings.antialias;
+    uint64_t frame = n ? renderer_present_count() : 0;
+    for (int i = 0; i < n; i++)
+        if (frame >= at[i]) r = mode[i];
+    return r;
 }
 
 static float halton(uint32_t i, uint32_t b) {

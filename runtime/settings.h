@@ -15,7 +15,14 @@ enum { UPSCALE_OFF = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /* AMD
 #endif
 // quality modes, AMD's scale factors (per axis): Ultra Quality 1.3, Quality 1.5, Balanced 1.7, Performance 2.0
 enum { UPQ_ULTRA = 0, UPQ_QUALITY = 1, UPQ_BALANCED = 2, UPQ_PERFORMANCE = 3, UPQ_COUNT };
-enum { AA_OFF = 0, AA_SMAA = 1 };
+// TAA (Vulkan): the game's own motion vectors (vulkan/mvec.c) and a jittered camera (output_scale.c rt_jitter_on)
+// blend each frame with the ones before it (vulkan/exec.c mvec_taa)
+enum { AA_OFF = 0, AA_SMAA = 1, AA_TAA = 2 };
+#ifdef __APPLE__
+#define AA_TAA_OR_SMAA AA_SMAA
+#else
+#define AA_TAA_OR_SMAA AA_TAA
+#endif
 // Shadow resolution (Video > Shadow resolution; runtime/nvn/output_scale.c shadow_map_size): the sun's shadow maps at
 // the console's size (BOTW: 896 x 896) or made bigger, for sharper shadows at some GPU time.
 enum { SHADOW_CONSOLE = 0, SHADOW_HIGH = 1 /* 2048 */, SHADOW_ULTRA = 2 /* 4096 */, SHADOW_EXTREME = 3 /* 8192 */, SHADOW_COUNT };

@@ -138,7 +138,11 @@ const int UPS_DEFAULT = 0;  // (UPSCALE_DEFAULT: Off, the window's resolution)
 std::vector<int> g_shown;   // per item: the value shown instead of get(), one that can't be picked yet (-1: none)
 const char16_t GREY = 3;    // (the game's message colour for greyed values)
 const char *const k_modes[] = {"Ultra Quality", "Quality", "Balanced", "Performance"};
+#ifdef __APPLE__
 const char *const k_aa[] = {"Off", "SMAA"};
+#else
+const char *const k_aa[] = {"Off", "SMAA", "TAA"};  // (settings.h AA_*)
+#endif
 const char *const k_aniso[] = {"Off", "2x", "4x", "8x", "16x"};  // (settings anisotropy 0..4)
 const char *const k_shadow[] = {"Console (896)", "High (2048)", "Ultra (4096)", "Extreme (8192)"};  // (SHADOW_*)
 const char *const k_icons[] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Nintendo"};  // (ICONS_*)

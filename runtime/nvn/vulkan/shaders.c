@@ -848,6 +848,60 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = pc.a.z == 2.0 ? vec4(clip - prev - v.xy, 0.0, 1.0) : vec4(clip - prev - jit, v.z, 0.5);\n"
                "}\n";
     }
+    // Temporal anti-aliasing (Video > Anti-aliasing TAA, exec.c mvec_taa): t0 this frame's scene (jittered, settings.h
+    // AA_TAA), t1 the history (the previous output, RGBA16F), t2 the motion vectors (mvec_fill.frag: clip-space NDC from
+    // the previous frame, clip y = minus the image's y; .z the reactive mask, .a 0 where there is none). The history is
+    // taken from where the pixel was (Catmull-Rom), kept inside this frame's 3x3 neighbourhood (a variance box in
+    // YCoCg, clipped toward its centre) so what was uncovered or changed doesn't ghost, and blended with the new
+    // frame at a.y, up to 0.3 at 16 pixels of motion a frame (less resampled history: less blur in a pan; luma-weighted
+    // against flicker); effects in the reactive mask take more of the new frame. a.x 0: no
+    // history (the first frame, or a skipped one). b.xy: the size.
+    if (!strcmp(name, "taa.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D t1;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D t2;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 yc(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }\n"
+               "vec3 rgb(vec3 y) { return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }\n"
+               "vec3 hist(vec2 uv, vec2 sz) {\n"  // (Catmull-Rom from 5 bilinear taps, the corners left out)
+               "  vec2 sp = uv * sz, tp = floor(sp - 0.5) + 0.5, f = sp - tp;\n"
+               "  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
+               "  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);\n"
+               "  vec2 w12 = w1 + w2, t12 = (tp + w2 / w12) / sz, t0_ = (tp - 1.0) / sz, t3 = (tp + 2.0) / sz;\n"
+               "  vec3 r = texture(t1, vec2(t12.x, t0_.y)).rgb * (w12.x * w0.y) + texture(t1, vec2(t0_.x, t12.y)).rgb * (w0.x * w12.y)\n"
+               "         + texture(t1, t12).rgb * (w12.x * w12.y) + texture(t1, vec2(t3.x, t12.y)).rgb * (w3.x * w12.y)\n"
+               "         + texture(t1, vec2(t12.x, t3.y)).rgb * (w12.x * w3.y);\n"
+               "  float w = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;\n"
+               "  return max(r / w, vec3(0.0));\n"
+               "}\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy), sz = ivec2(pc.b.xy);\n"
+               "  vec4 c4 = texelFetch(t0, p, 0);\n"
+               "  vec3 c = yc(c4.rgb), m1 = vec3(0.0), m2 = vec3(0.0), mn = c, mx = c;\n"
+               "  for (int y = -1; y <= 1; y++)\n"
+               "    for (int x = -1; x <= 1; x++) {\n"
+               "      vec3 s = yc(texelFetch(t0, clamp(p + ivec2(x, y), ivec2(0), sz - 1), 0).rgb);\n"
+               "      m1 += s; m2 += s * s; mn = min(mn, s); mx = max(mx, s);\n"
+               "    }\n"
+               "  vec4 v = texelFetch(t2, p, 0);\n"
+               "  vec2 uv = gl_FragCoord.xy / pc.b.xy, pv = uv - vec2(v.x, -v.y) * 0.5;\n"
+               "  if (pc.a.x == 0.0 || v.a < 0.25 || any(lessThan(pv, vec2(0.0))) || any(greaterThan(pv, vec2(1.0)))) { o = c4; return; }\n"
+               "  vec3 mu = m1 / 9.0, sg = sqrt(max(m2 / 9.0 - mu * mu, vec3(0.0)));\n"
+               "  vec3 lo = max(mn, mu - 1.25 * sg), hi = min(mx, mu + 1.25 * sg);\n"
+               "  vec3 h = yc(hist(pv, pc.b.xy));\n"
+
+               "  vec3 ctr = 0.5 * (lo + hi), ext = max(0.5 * (hi - lo), vec3(1.0 / 1024.0)), d = h - ctr;\n"
+               "  vec3 u = abs(d / ext);\n"
+               "  float k = max(u.x, max(u.y, u.z));\n"
+               "  if (k > 1.0) h = ctr + d / k;\n"
+               "  float a = max(mix(pc.a.y, 0.3, clamp(length(v.xy * pc.b.xy) / 32.0, 0.0, 1.0)), clamp(v.z, 0.0, 1.0));\n"
+               "  float wc = a / (1.0 + c.x), wh = (1.0 - a) / (1.0 + h.x);\n"
+               "  o = vec4(rgb((c * wc + h * wh) / (wc + wh)), c4.a);\n"
+               "}\n";
+    }
     if (!strcmp(name, "cas.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

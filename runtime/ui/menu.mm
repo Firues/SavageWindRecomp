@@ -692,10 +692,22 @@ static void tab_display(void) {
                          md.c_str());
         opt_indent(-1);
     }
+#ifdef __APPLE__
     static const char *aa[] = {"Off", "SMAA"};
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful with an upscaler.");
+#else
+    {   // (the TAA sentence on its own: the first one keeps its translations)
+        static const char *aa[] = {"Off", "SMAA", "TAA"};  // (settings.h AA_*)
+        static std::string d;
+        d = std::string(tr("Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the "
+                           "edges and blends only along them, so textures stay sharp. Most useful with an upscaler.")) +
+            " " + tr("TAA: blends each frame with the ones before it, following the game's motion, so edges stay "
+                     "smooth and stop shimmering; slightly softer, use it with Sharpening.");
+        opt_choice("Anti-aliasing", &g_settings.antialias, aa, 3, AA_OFF, d.c_str());
+    }
+#endif
 #ifndef __APPLE__
     {   // Anisotropic filtering and sharpening (Vulkan: vulkan/textures.c sampler_aniso, vulkan/exec.c scene_post)
         static const char *const aniso[] = {"Off", "2x", "4x", "8x", "16x"};

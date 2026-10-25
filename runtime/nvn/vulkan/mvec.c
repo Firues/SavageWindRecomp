@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "../../rt.h"
+#include "../../settings.h"
 #include "../output_scale.h"
 #include "mvec.h"
 
@@ -156,9 +157,17 @@ static void camera_finish(Slot *s) {
 }
 
 
+uint64_t renderer_present_count(void);
+// On with Video > Anti-aliasing TAA (settings.h AA_TAA), read once a presented frame so a frame is all on or all off;
+// SAVAGEWIND_MVEC=1 / 0 turns it on or off whatever the setting.
 bool mvec_enabled(void) {
-    static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_MVEC") && atoi(getenv("SAVAGEWIND_MVEC")) != 0;
+    static int env = -2;
+    if (env == -2) env = getenv("SAVAGEWIND_MVEC") ? atoi(getenv("SAVAGEWIND_MVEC")) != 0 : -1;
+    if (env >= 0) return env;
+    static uint64_t at = ~0ull;
+    static bool on;
+    uint64_t f = renderer_present_count();
+    if (f != at) at = f, on = rt_antialias() == AA_TAA;
     return on;
 }
 

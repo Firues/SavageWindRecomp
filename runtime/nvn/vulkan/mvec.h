@@ -49,7 +49,7 @@ typedef struct {
     uint32_t inst_off[MVEC_INST], inst_size[MVEC_INST];
 } MvecRec;
 
-bool mvec_enabled(void);  // SAVAGEWIND_MVEC=1
+bool mvec_enabled(void);  // Video > Anti-aliasing TAA, or SAVAGEWIND_MVEC=1
 // Records a scene draw of the current frame: its index among the frame's records, -1 when not recorded (off, or the
 // history buffer is full: grown for the next frame).
 int mvec_record(const MvecDrawIn *d);

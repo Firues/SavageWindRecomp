@@ -5810,7 +5810,7 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
 // Post image `i` at w x h in format f (kept until the size or format changes). 0, 1: SMAA edges / weights, 2: SMAA
 // output, 3, 4: FSR EASU / RCAS of the presented image; 5, 6: FSR EASU / RCAS of the 3D scene, 7: its CAS
 // sharpening (scene_post).
-enum { POST_IMAGES = 11 };  // (mvec: 8 the object vectors, 9 the debug view, 10 the motion vectors)
+enum { POST_IMAGES = 13 };  // (mvec: 8 the object vectors, 9 the debug view, 10 the motion vectors, 11 / 12 TAA)
 static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f) {
     static TexBackend img[POST_IMAGES];
     TexBackend *d = &img[i];
@@ -5908,7 +5908,7 @@ static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *src
 // size in the window (its crop is drawn into the viewport).
 static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d) {
     VkImageView v = raw_view(b);
-    bool smaa = g_settings.antialias == AA_SMAA;
+    bool smaa = rt_antialias() == AA_SMAA;
     uint32_t ow = (uint32_t)lround(ow_d), oh = (uint32_t)lround(oh_d);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
@@ -5978,15 +5978,17 @@ static NvnTexture *scene_composite(Prog *pr, CmdRec *r) {
     return NULL;
 }
 
-static bool mvec_scene_view(Prog *pr, CmdRec *r);
+static bool mvec_scene_view(Prog *pr, CmdRec *r, NvnTexture **taa_t, TexBackend **taa);
 static void scene_post(Prog *pr, CmdRec *r) {
     scene_up.t = NULL;
-    if (mvec_enabled() && mvec_scene_view(pr, r)) return;
+    NvnTexture *taa_t = NULL;
+    TexBackend *taa = NULL;  // (TAA's output for the scene taa_t: what FSR 1 and CAS start from)
+    if (mvec_enabled() && mvec_scene_view(pr, r, &taa_t, &taa)) return;
     static int fsr_on = -1, cas_on = -1;
     if (fsr_on < 0) fsr_on = getenv("SAVAGEWIND_SCENE_FSR") ? atoi(getenv("SAVAGEWIND_SCENE_FSR")) : 1;
     if (cas_on < 0) cas_on = getenv("SAVAGEWIND_SCENE_CAS") ? atoi(getenv("SAVAGEWIND_SCENE_CAS")) : 1;
     bool fsr = fsr_on && g_settings.upscaler == UPSCALE_FSR1, cas = cas_on && g_settings.sharpening > 0;
-    if (!fsr && !cas) return;
+    if (!fsr && !cas && !taa) return;
     NvnTexture *t = scene_composite(pr, r), *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
     if (!t) return;
     const float *vp = st.viewport[0];
@@ -5998,16 +6000,17 @@ static void scene_post(Prog *pr, CmdRec *r) {
     {
         TexBackend *b = vk_tex(t, false);
         bool up = fsr && (ow > b->width + 1 || oh > b->height + 1);  // (else at its size in the window already)
-        if (!up && !cas) return;
+        if (t != taa_t) taa = NULL;
+        if (!up && !cas && !taa) return;
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
         if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) return;
         vk_end_pass();
         VkCommandBuffer cb = vk_cmd();
         static const VkComponentMapping id = {0};
-        VkImageView src = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkImageView src = taa ? post_view(taa) : vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
         uint32_t w = b->width, h = b->height;
-        TexBackend *out = NULL;
+        TexBackend *out = taa;
         if (up) {
             TexBackend *e = post_image(5, ow, oh, b->format), *o = post_image(6, ow, oh, b->format);
             float iw = (float)b->width, ih = (float)b->height;
@@ -6035,10 +6038,11 @@ static void scene_post(Prog *pr, CmdRec *r) {
         scene_up.sy = (float)h / (float)t->height;
         static uint32_t lw, lh, low, loh;
         static int lcas = -1;
-        if (b->width != lw || b->height != lh || w != low || h != loh || g_settings.sharpening != lcas)
-            LOG("[post] scene %ux%u%s -> %ux%u%s (format %d)\n", b->width, b->height, up ? " fsr1" : "", w, h,
-                cas ? " cas" : "", b->format);
-        lw = b->width; lh = b->height; low = w; loh = h; lcas = g_settings.sharpening;
+        static bool ltaa;
+        if (b->width != lw || b->height != lh || w != low || h != loh || g_settings.sharpening != lcas || !!taa != ltaa)
+            LOG("[post] scene %ux%u%s%s -> %ux%u%s (format %d)\n", b->width, b->height, taa ? " taa" : "", up ? " fsr1" : "",
+                w, h, cas ? " cas" : "", b->format);
+        lw = b->width; lh = b->height; low = w; loh = h; lcas = g_settings.sharpening; ltaa = !!taa;
         return;
     }
 }
@@ -6355,10 +6359,14 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
 // (mvec.c) At the scene composite (scene_post's detection: the draw that puts the 3D scene, t, into the final image),
 // once a frame: the motion vectors of the frame (post image 10, the motion target's size): the object vectors where a
 // draw wrote one, the camera's motion elsewhere (shaders.c mvec_fill.frag, mvec_reprojection). SAVAGEWIND_MVEC_VIEW:
-// then drawn over the scene (mvec_view.frag) into an image the composite samples instead of it (scene_up).
+// then drawn over the scene (mvec_view.frag) into an image the composite samples instead of it (scene_up). With
+// Video > Anti-aliasing TAA, mvec_taa's output for the scene t in *taa_t / *taa (scene_post goes on from it).
 static TexBackend *mvec_vectors_img;
 static uint64_t mvec_filled = ~0ull;
-static bool mvec_scene_view(Prog *pr, CmdRec *r) {
+static TexBackend *mvec_taa(VkCommandBuffer cb, TexBackend *b, uint64_t frame);
+static TexBackend *taa_img;  // (this frame's TAA output, of the scene taa_tex)
+static NvnTexture *taa_tex;
+static bool mvec_scene_view(Prog *pr, CmdRec *r, NvnTexture **taa_t, TexBackend **taa) {
     NvnTexture *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
     if (!mvec_target_img || !rt || r->x[2] > 6 || !pr->fi->ntex || vk_texture_scale_group(rt) != RS_OUT) return false;
     const float *vp = st.viewport[0];
@@ -6392,7 +6400,10 @@ static bool mvec_scene_view(Prog *pr, CmdRec *r) {
             VkImageView in[3] = {post_view(mvec_target_img), dv};
             post_pass_pc(cb, "mvec_fill.frag", in, 2, mvec_vectors_img, pc, sizeof pc, false);
             vk_full_barrier(cb);
+            taa_img = rt_antialias() == AA_TAA ? mvec_taa(cb, b, frame) : NULL;
+            taa_tex = t;
         }
+        if (mvec_filled == frame && taa_img && taa_tex == t) *taa = taa_img, *taa_t = t;  // (a second composite: the same)
         if (!mvec_view_enabled()) return false;
         TexBackend *vec = mvec_filled == frame && mvec_vectors_img ? mvec_vectors_img : mvec_target_img;
         vk_end_pass();
@@ -6410,6 +6421,28 @@ static bool mvec_scene_view(Prog *pr, CmdRec *r) {
         return true;
     }
     return false;
+}
+
+// Temporal anti-aliasing (Video > Anti-aliasing TAA; shaders.c taa.frag): the scene b (jittered: output_scale.c
+// rt_persp_offset) blended with the previous output (post images 11 and 12 in turn, RGBA16F) along this frame's motion
+// vectors (just filled). The history starts over when a frame was not blended (TAA off, a frame without the scene)
+// or the size changed. NULL when the vectors aren't the scene's size.
+static TexBackend *mvec_taa(VkCommandBuffer cb, TexBackend *b, uint64_t frame) {
+    if (!mvec_vectors_img || mvec_vectors_img->width != b->width || mvec_vectors_img->height != b->height) return NULL;
+    static uint64_t last = ~0ull;
+    static int n;
+    TexBackend *hist = post_image(11 + n, b->width, b->height, VK_FORMAT_R16G16B16A16_SFLOAT);
+    bool valid = last != ~0ull && last + 1 == frame;
+    n ^= 1;
+    TexBackend *out = post_image(11 + n, b->width, b->height, VK_FORMAT_R16G16B16A16_SFLOAT);
+    static const VkComponentMapping id = {0};
+    VkImageView in[3] = {vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT),
+                         post_view(hist), post_view(mvec_vectors_img)};
+    float pc[8] = {valid ? 1.0f : 0.0f, 0.1f, 0, 0, (float)b->width, (float)b->height};  // (0.1: the new frame's share)
+    post_pass_pc(cb, "taa.frag", in, 3, out, pc, sizeof pc, false);
+    vk_full_barrier(cb);
+    last = frame;
+    return out;
 }
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
