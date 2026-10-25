@@ -14,6 +14,7 @@
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
+#include "mvec.h"
 #include "../renderer.h"
 #include "../../settings.h"
 #include "../output_scale.h"
@@ -5052,6 +5053,32 @@ have_pipe:
     if (use_index && (dc.ibuf != ib.buf || dc.ioff != ib.off || dc.itype != (uint32_t)itype_vk)) {
         vkCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
         dc.ibuf = ib.buf; dc.ioff = ib.off; dc.itype = itype_vk;
+    }
+
+    // ---- motion vectors (mvec.c): the opaque scene draws (writing depth at the internal resolution), their
+    // identity and the vertex shader's inputs, kept for the next frame
+    if (mvec_enabled() && st.rt.depth && st.ds[0] && st.ds[1] && vk_texture_scale_group(st.rt.depth) == RS_SCENE) {
+        MvecDrawIn md = {0};
+        md.frame = renderer_present_count();
+        md.gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED);
+        md.vs = st.program->stages[0].code_addr;
+        md.fs = st.program->stages[1].code_addr;
+        md.iaddr = indexed ? r->x[3] : 0;
+        md.count = count; md.first = first; md.base_vertex = base_vertex; md.inst = inst; md.base_inst = base_inst;
+        md.nstream = st.nstream;
+        for (int s = 0; s < st.nstream && s < 16; s++)
+            md.stream[s] = (MvecStream){st.vbuf[s].addr, st.vbuf[s].size, st.stream[s][0], st.stream[s][1]};
+        for (int a = 0; a < 16 && a < st.nattrib; a++)
+            if ((pr->vi->attr_mask >> a) & 1) md.vs_streams |= 1u << ((st.attrib[a] >> 8) & 0x1F);
+        for (int k = 3; k < 17 && md.ncb < MVEC_CB; k++) {  // (the game's buffers: cbuf_info's k >= 3)
+            Range u = st.ubuf[0][k - 3];
+            if (!((pr->vi->cbuf_mask >> k) & 1) || !u.addr) continue;
+            uint64_t size = pr->vi->cbuf_size[k] ? pr->vi->cbuf_size[k] : 256;
+            if ((pr->vi->cbuf_dynamic & (1u << k)) && u.size) size = u.size > 0x10000 ? 0x10000 : u.size;
+            if (size > u.size && u.size) size = u.size;
+            md.cb[md.ncb].slot = (uint8_t)k; md.cb[md.ncb].addr = u.addr; md.cb[md.ncb++].size = size;
+        }
+        mvec_record(&md);
     }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
