@@ -788,10 +788,11 @@ static const char *builtin_src(const char *name, int *stage) {
     // path): a 3x3 neighbourhood's soft minimum and maximum set how far each pixel may be pushed away from its cross
     // neighbours, so edges sharpen without halos and flat or noisy areas stay. a.x = sharpness 0..1 (peak -1/8 ..
     // -1/5), b.xy = image size. Alpha passes through (exec.c scene_post).
-    // Motion vectors over the scene (SAVAGEWIND_MVEC_VIEW, exec.c mvec_scene_view): t0 the scene, t1 the motion target
-    // (exec.c begin_pass: NDC distance from the previous frame in .xy, .a 1 where a draw wrote one). Pixels with a
-    // vector: the scene's grey mixed with a hue for the direction, as strong as its length against a.x pixels; without
-    // one: the scene darkened and blue. b.xy: the motion target's size, b.zw: the output's.
+    // Motion vectors over the scene (SAVAGEWIND_MVEC_VIEW, exec.c mvec_scene_view): t0 the scene, t1 the motion vectors
+    // (exec.c mvec_fill: NDC distance from the previous frame in .xy; .a 1 for a draw's own vector, 0.5 for the camera's,
+    // 0 for none). The scene's grey mixed with a hue for the direction, as strong as the length against a.x pixels;
+    // camera vectors hatched; no vector: the scene darkened and blue. a.x < 0: raw (red = .a, green / blue = |x| / |y|
+    // times -a.x). b.xy: the motion vectors' size, b.zw: the output's.
     if (!strcmp(name, "mvec_view.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
@@ -805,11 +806,13 @@ static const char *builtin_src(const char *name, int *stage) {
                "  float l = dot(s.rgb, vec3(0.299, 0.587, 0.114));\n"
                "  vec4 m = texelFetch(t1, ivec2(uv * pc.b.xy), 0);\n"
                "  if (pc.a.x < 0.0) { o = vec4(m.a, clamp(abs(m.xy) * -pc.a.x, 0.0, 1.0), s.a); return; }\n"
-               "  if (m.a < 0.5) { o = vec4(l * 0.3, l * 0.3, l * 0.3 + 0.2, s.a); return; }\n"
+               "  if (m.a < 0.25) { o = vec4(l * 0.3, l * 0.3, l * 0.3 + 0.2, s.a); return; }\n"
                "  vec2 px = m.xy * 0.5 * pc.b.xy;\n"
                "  float k = clamp(length(px) / max(pc.a.x, 0.001), 0.0, 1.0);\n"
                "  vec3 hue = 0.5 + 0.5 * cos(atan(px.y, px.x) + vec3(0.0, 2.094, 4.189));\n"
-               "  o = vec4(mix(vec3(l * 0.6), hue, k), s.a);\n"
+               "  vec3 c = mix(vec3(l * 0.6), hue, k);\n"
+               "  if (m.a < 0.75 && ((int(gl_FragCoord.x + gl_FragCoord.y) >> 3) & 1) != 0) c = mix(c, vec3(l * 0.6), 0.65);\n"
+               "  o = vec4(c, s.a);\n"
                "}\n";
     }
     // Motion vectors for the pixels no draw gave one (exec.c mvec_fill): t0 the object vectors (begin_pass's motion
