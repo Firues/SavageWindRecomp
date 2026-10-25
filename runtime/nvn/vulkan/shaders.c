@@ -812,6 +812,34 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = vec4(mix(vec3(l * 0.6), hue, k), s.a);\n"
                "}\n";
     }
+    // Motion vectors for the pixels no draw gave one (exec.c mvec_fill): t0 the object vectors (begin_pass's motion
+    // target, alpha 1 where written), t1 the scene depth. Those pixels get the camera's motion: this frame's NDC from
+    // their position and depth, taken by m (the previous frame's view-projection * the inverse of this frame's) to the
+    // previous frame's; alpha 0.5. Vectors are clip-space NDC differences, as the object vectors (mvec_rt): the
+    // viewports have a negative height (exec.c set_viewport: y up), so a pixel's clip y is minus its framebuffer NDC y,
+    // and the game's NDC y is that times a.x (-1 when the vertex shaders flip y, ShaderKey.flip_y). a.y: 1 when the
+    // game's depth range is [-1, 1] (depth = (z + 1) / 2). a.z: 1 = camera vectors everywhere, 2 = camera minus object
+    // vector where there is one (SAVAGEWIND_MVEC_CAMONLY).
+    if (!strcmp(name, "mvec_fill.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D t1;\n"
+               "layout(push_constant) uniform P { layout(row_major) mat4 m; vec4 a; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+               "  vec4 v = texelFetch(t0, p, 0);\n"
+               "  if (v.a > 0.5 && pc.a.z == 0.0) { o = v; return; }\n"
+               "  if (v.a < 0.5 && pc.a.z == 2.0) { o = vec4(0.0); return; }\n"
+               "  vec2 fb = gl_FragCoord.xy / vec2(textureSize(t0, 0)) * 2.0 - 1.0;\n"
+               "  vec2 clip = vec2(fb.x, -fb.y);\n"
+               "  float d = texelFetch(t1, p, 0).r;\n"
+               "  vec4 q = pc.m * vec4(clip.x, clip.y * pc.a.x, pc.a.y != 0.0 ? d * 2.0 - 1.0 : d, 1.0);\n"
+               "  vec2 prev = vec2(q.x, q.y * pc.a.x) / q.w;\n"
+               "  o = pc.a.z == 2.0 ? vec4(clip - prev - v.xy, 0.0, 1.0) : vec4(clip - prev, 0.0, 0.5);\n"
+               "}\n";
+    }
     if (!strcmp(name, "cas.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

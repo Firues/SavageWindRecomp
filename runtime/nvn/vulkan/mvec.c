@@ -110,14 +110,13 @@ static bool camera_plausible(const MvecCamera *c) {
     return fabsf(p[5] * w[0] - 1) < 0.02f && fabsf(p[0] * w[0] * w[1] - 1) < 0.02f;
 }
 
-// The finished frame's camera, from its camera block's copy in the slot's history
-static void camera_finish(Slot *s) {
-    MvecCamera *c = &s->cam;
+// A frame's camera, from its camera block's copy in the slot's history (the block most of the frame's draws so far
+// read); false when there is none or it fails camera_plausible
+static bool camera_compute(Slot *s, MvecCamera *c) {
     c->valid = false;
     int best = -1;
     for (int i = 0; i < ncamc; i++) if (best < 0 || camc[i].n > camc[best].n) best = i;
-    ncamc = 0;
-    if (best < 0 || camc[best].size < 11 * 16) return;
+    if (best < 0 || camc[best].size < 11 * 16) return false;
     float rows[11 * 4];
     memcpy(rows, s->ptr + camc[best].off, sizeof rows);  // (write-combined memory: one read of 176 bytes)
     memcpy(c->view, rows, 12 * 4);
@@ -132,10 +131,16 @@ static void camera_finish(Slot *s) {
                          "projection: no camera vectors\n", (unsigned long long)s->frame, (unsigned long long)camc[best].addr,
                          camc[best].n);
         warned = true;
-        return;
+        return false;
     }
     c->valid = true;
-    stat.cameras++;
+    return true;
+}
+
+// The finished frame's camera (when the next frame begins)
+static void camera_finish(Slot *s) {
+    if (camera_compute(s, &s->cam)) stat.cameras++;
+    ncamc = 0;
 }
 
 
@@ -343,6 +348,12 @@ VkDescriptorBufferInfo mvec_history_info(void) {
     return (VkDescriptorBufferInfo){i >= 0 ? slots[i].buf : VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
 }
 
+int mvec_camera_only(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_MVEC_CAMONLY") ? atoi(getenv("SAVAGEWIND_MVEC_CAMONLY")) : 0;
+    return on;
+}
+
 float mvec_view_enabled(void) {
     static float px;
     static bool init;
@@ -352,6 +363,14 @@ float mvec_view_enabled(void) {
         px = e ? (atof(e) != 0 ? (float)atof(e) : 16.0f) : 0.0f;
     }
     return px;
+}
+
+bool mvec_reprojection(float m[16]) {
+    if (cur < 0 || prev < 0 || !slots[prev].cam.valid) return false;
+    MvecCamera now;
+    if (!camera_compute(&slots[cur], &now)) return false;
+    mat4_mul(slots[prev].cam.vp, now.inv_vp, m);
+    return true;
 }
 
 const MvecCamera *mvec_camera(bool previous) {

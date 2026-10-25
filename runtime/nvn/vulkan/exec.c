@@ -877,6 +877,7 @@ static VkImageView post_view(TexBackend *d);
 // The motion target for a pass writing `depth` (minw x minh: the pass's size): the internal-resolution scene depth's
 // size (the largest RS_SCENE depth seen; its halves and levels get none), NULL for other passes
 static TexBackend *mvec_target_img;
+static NvnTexture *mvec_depth;  // the scene depth the motion target was last drawn with (mvec_fill)
 static TexBackend *mvec_pass_target(NvnTexture *depth, uint32_t minw, uint32_t minh) {
     if (vk_texture_scale_group(depth) != RS_SCENE || (st.rt.has_dview && (st.rt.dview.setmask & 1) && st.rt.dview.base_level))
         return NULL;
@@ -1374,6 +1375,7 @@ static void begin_pass(void) {
                                                                                           : VK_ATTACHMENT_LOAD_OP_CLEAR,
                                                           .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
             mvec_cleared = frame;
+            mvec_depth = st.rt.depth;
             pass_color[pass_ncolor] = mt->format;
             pass_mvec = (int)pass_ncolor++;
         }
@@ -5746,7 +5748,7 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
             b[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = b};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &post_set_layout));
-        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112};  // (the passes push 32 bytes, fg_mv.frag 112)
+        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};  // (32 bytes, or up to 128: post_pass_pc; fg_mv.frag 112)
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                          .pSetLayouts = &post_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &post_layout));
@@ -5785,7 +5787,7 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
 // Post image `i` at w x h in format f (kept until the size or format changes). 0, 1: SMAA edges / weights, 2: SMAA
 // output, 3, 4: FSR EASU / RCAS of the presented image; 5, 6: FSR EASU / RCAS of the 3D scene, 7: its CAS
 // sharpening (scene_post).
-enum { POST_IMAGES = 10 };  // (8: the motion target, 9: its view: mvec)
+enum { POST_IMAGES = 11 };  // (mvec: 8 the object vectors, 9 the debug view, 10 the motion vectors)
 static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f) {
     static TexBackend img[POST_IMAGES];
     TexBackend *d = &img[i];
@@ -5956,7 +5958,7 @@ static NvnTexture *scene_composite(Prog *pr, CmdRec *r) {
 static bool mvec_scene_view(Prog *pr, CmdRec *r);
 static void scene_post(Prog *pr, CmdRec *r) {
     scene_up.t = NULL;
-    if (mvec_view_enabled() != 0 && mvec_scene_view(pr, r)) return;
+    if (mvec_enabled() && mvec_scene_view(pr, r)) return;
     static int fsr_on = -1, cas_on = -1;
     if (fsr_on < 0) fsr_on = getenv("SAVAGEWIND_SCENE_FSR") ? atoi(getenv("SAVAGEWIND_SCENE_FSR")) : 1;
     if (cas_on < 0) cas_on = getenv("SAVAGEWIND_SCENE_CAS") ? atoi(getenv("SAVAGEWIND_SCENE_CAS")) : 1;
@@ -6327,8 +6329,12 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
     return out;
 }
 
-// (mvec.c, SAVAGEWIND_MVEC_VIEW) At the scene composite (scene_post's detection): the motion target drawn over the
-// scene (shaders.c mvec_view.frag) into an image the composite samples instead of the scene (scene_up)
+// (mvec.c) At the scene composite (scene_post's detection: the draw that puts the 3D scene, t, into the final image),
+// once a frame: the motion vectors of the frame (post image 10, the motion target's size): the object vectors where a
+// draw wrote one, the camera's motion elsewhere (shaders.c mvec_fill.frag, mvec_reprojection). SAVAGEWIND_MVEC_VIEW:
+// then drawn over the scene (mvec_view.frag) into an image the composite samples instead of it (scene_up).
+static TexBackend *mvec_vectors_img;
+static uint64_t mvec_filled = ~0ull;
 static bool mvec_scene_view(Prog *pr, CmdRec *r) {
     NvnTexture *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
     if (!mvec_target_img || !rt || r->x[2] > 6 || !pr->fi->ntex || vk_texture_scale_group(rt) != RS_OUT) return false;
@@ -6342,14 +6348,35 @@ static bool mvec_scene_view(Prog *pr, CmdRec *r) {
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
         if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) continue;
+        uint64_t frame = renderer_present_count();
+        float m[16];
+        TexBackend *db = mvec_depth ? vk_tex(mvec_depth, false) : NULL;
+        if (mvec_filled != frame && db && db->image && db->width == mvec_target_img->width &&
+            db->height == mvec_target_img->height && mvec_reprojection(m)) {
+            mvec_filled = frame;
+            vk_end_pass();
+            VkCommandBuffer cb = vk_cmd();
+            static const VkComponentMapping id = {0};
+            VkImageView dv = vk_image_view(db, VK_IMAGE_VIEW_TYPE_2D, db->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
+            mvec_vectors_img = post_image(10, mvec_target_img->width, mvec_target_img->height, mvec_target_img->format);
+            float pc[20];
+            memcpy(pc, m, sizeof m);
+            pc[16] = nvn_window_origin() == 0 ? -1.0f : 1.0f;
+            pc[17] = nvn_depth_mode() == 0 ? 1.0f : 0.0f;
+            pc[18] = (float)mvec_camera_only();
+            VkImageView in[3] = {post_view(mvec_target_img), dv};
+            post_pass_pc(cb, "mvec_fill.frag", in, 2, mvec_vectors_img, pc, sizeof pc, false);
+            vk_full_barrier(cb);
+        }
+        if (!mvec_view_enabled()) return false;
+        TexBackend *vec = mvec_filled == frame && mvec_vectors_img ? mvec_vectors_img : mvec_target_img;
         vk_end_pass();
         VkCommandBuffer cb = vk_cmd();
         static const VkComponentMapping id = {0};
         VkImageView src = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
         TexBackend *o = post_image(9, b->width, b->height, b->format);
-        float pc[8] = {mvec_view_enabled(), 0, 0, 0, (float)mvec_target_img->width, (float)mvec_target_img->height,
-                       (float)b->width, (float)b->height};
-        VkImageView in[3] = {src, post_view(mvec_target_img)};
+        float pc[8] = {mvec_view_enabled(), 0, 0, 0, (float)vec->width, (float)vec->height, (float)b->width, (float)b->height};
+        VkImageView in[3] = {src, post_view(vec)};
         post_pass(cb, "mvec_view.frag", in, 2, o, pc, false);
         vk_full_barrier(cb);
         scene_up.t = t;
