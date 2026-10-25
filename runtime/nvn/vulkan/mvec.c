@@ -14,8 +14,8 @@
 // holding one frame's copies; a frame's copies are read again during the next frame (as "previous"), so a slot is
 // reused only once the GPU is done with the frames that read it. A frame that fills its slot stops recording (its
 // remaining draws get no motion) and the slot is grown before its next use.
-// SAVAGEWIND_MVEC=1: on (off by default while this is being built). SAVAGEWIND_MVEC_LOG=<frames>: statistics every
-// that many frames (default 240).
+// On with Video > Anti-aliasing TAA (mvec_enabled; SAVAGEWIND_MVEC=1 / 0 whatever the setting).
+// SAVAGEWIND_MVEC_LOG=<frames>: statistics every that many frames (default: none).
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,9 +194,15 @@ static void slot_alloc(Slot *s, uint64_t cap) {
     s->cap = cap;
 }
 
-static void log_stats(uint64_t frame) {
+// SAVAGEWIND_MVEC_LOG=<frames>: the statistics every that many frames (0, the default: none, and the costlier ones,
+// the matching checks, are not gathered)
+static int log_every(void) {
     static int every = -1;
-    if (every < 0) every = getenv("SAVAGEWIND_MVEC_LOG") ? atoi(getenv("SAVAGEWIND_MVEC_LOG")) : 240;
+    if (every < 0) every = getenv("SAVAGEWIND_MVEC_LOG") ? atoi(getenv("SAVAGEWIND_MVEC_LOG")) : 0;
+    return every;
+}
+static void log_stats(uint64_t frame) {
+    int every = log_every();
     if (every <= 0 || ++stat.frames < (uint64_t)every) return;
     double f = (double)stat.frames;
     LOG("[mvec] frame %llu: %.0f scene draws a frame, matched %.1f%% (%.0f with a repeated key, %.1f%% drawn with motion), "
@@ -274,6 +280,7 @@ static void frame_begin(uint64_t frame) {
 static float fingerprint_distance(const MvecRec *a, const MvecRec *b) {
     int n = a->nfeat < b->nfeat ? a->nfeat : b->nfeat;
     if (!n || a->nfeat != b->nfeat) return 1;
+    if (!memcmp(a->feat, b->feat, (size_t)n * sizeof a->feat[0])) return 0;  // (a still object: most draws)
     float d = 0;
     for (int i = 0; i < n; i++) {
         float x = a->feat[i], y = b->feat[i];
@@ -405,8 +412,11 @@ int mvec_record(const MvecDrawIn *d) {
         r->cb_size[r->ncb++] = (uint32_t)d->cb[k].size;
         stat.cb_bytes += d->cb[k].size;
     }
-    for (int k = 0; k < d->ncb && r->nfeat + 12 <= MVEC_FEAT; k++) {  // (the fingerprint, from guest memory as it is now)
-        if (!d->cb[k].addr || d->cb[k].size < 48) continue;
+    // the fingerprint, from guest memory as it is now; not from the camera block (slot 3), which the scene's draws share:
+    // it tells no draw apart, and as the camera moves no draw's fingerprint was equal to its match's any more, so the
+    // search never stopped early (0.9 ms a frame of matching)
+    for (int k = 0; k < d->ncb && r->nfeat + 12 <= MVEC_FEAT; k++) {
+        if (!d->cb[k].addr || d->cb[k].size < 48 || d->cb[k].slot == 3) continue;
         memcpy(&r->feat[r->nfeat], (const void *)(uintptr_t)d->cb[k].addr, 48);
         r->nfeat += 12;
     }
@@ -415,20 +425,20 @@ int mvec_record(const MvecDrawIn *d) {
     static int by_order = -1;  // SAVAGEWIND_MVEC_MATCH=order: (testing) match by draw order alone
     if (by_order < 0) by_order = getenv("SAVAGEWIND_MVEC_MATCH") && !strcmp(getenv("SAVAGEWIND_MVEC_MATCH"), "order");
     r->prev = by_order ? prev_lookup(key, r->ord) : prev_match(r);
-    {  // (statistics) the object's world position (slot 4's translation) against each matching's previous draw
+    if (log_every() > 0) {  // (statistics) the object's world position (slot 4's translation) against each matching's previous draw
         int32_t po = prev_lookup(key, r->ord), pf = by_order ? -1 : r->prev;
-        if (r->nfeat >= 24 && r->cb_slot[0] == 3 && r->cb_slot[1] == 4 && po >= 0 && pf >= 0) {
+        if (r->nfeat >= 12 && r->cb_slot[0] == 3 && r->cb_slot[1] == 4 && po >= 0 && pf >= 0) {
             stat.moved_checked++;
-            const float *t = &r->feat[12];
+            const float *t = &r->feat[0];
             for (int m = 0; m < 2; m++) {
                 const MvecRec *q = &slots[prev].rec[m ? pf : po];
-                if (q->nfeat < 24) continue;
-                float dx = t[3] - q->feat[15], dy = t[7] - q->feat[19], dz = t[11] - q->feat[23];
+                if (q->nfeat < 12) continue;
+                float dx = t[3] - q->feat[3], dy = t[7] - q->feat[7], dz = t[11] - q->feat[11];
                 if (dx * dx + dy * dy + dz * dz > 1e-4f) { if (m) stat.moved_fp++; else stat.moved_order++; }
             }
         }
     }
-    if (r->prev >= 0 && r->prev != prev_lookup(key, r->ord)) stat.not_ordinal++;
+    if (log_every() > 0 && r->prev >= 0 && r->prev != prev_lookup(key, r->ord)) stat.not_ordinal++;
     if (r->ord) stat.repeated++;
     if (r->prev >= 0) stat.matched++;
     else stat.unmatched++;
