@@ -47,7 +47,8 @@ static Dedupe dedupe[DEDUPE];
 static Index prev_index[INDEX], ord_index[INDEX];
 
 static struct {  // since the last log line
-    uint64_t frames, draws, matched, repeated, unmatched, dropped, cb_bytes, inst_bytes, copied, dedupe_hits, max_used;
+    uint64_t frames, draws, matched, repeated, unmatched, dropped, cb_bytes, inst_bytes, copied, dedupe_hits, max_used, motion,
+        unchanged;  // motion draws whose previous constants are the same bytes as the current ones
 } stat;
 
 bool mvec_enabled(void) {
@@ -84,12 +85,14 @@ static void log_stats(uint64_t frame) {
     if (every < 0) every = getenv("SAVAGEWIND_MVEC_LOG") ? atoi(getenv("SAVAGEWIND_MVEC_LOG")) : 240;
     if (every <= 0 || ++stat.frames < (uint64_t)every) return;
     double f = (double)stat.frames;
-    LOG("[mvec] frame %llu: %.0f scene draws a frame, matched %.1f%% (%.0f with a repeated key), unmatched %.0f, "
+    LOG("[mvec] frame %llu: %.0f scene draws a frame, matched %.1f%% (%.0f with a repeated key, %.1f%% drawn with motion), "
+        "unmatched %.0f, "
         "not recorded %.0f; inputs %.0f KB constants + %.0f KB instance data a frame, %.0f KB copied (%.0f copies "
-        "shared); history slot at most %.1f MB used of %.1f\n",
+        "shared); history slot at most %.1f MB used of %.1f; %.1f%% of the motion draws with unchanged constants\n",
         (unsigned long long)frame, stat.draws / f, stat.draws ? 100.0 * stat.matched / stat.draws : 0.0, stat.repeated / f,
-        stat.unmatched / f, stat.dropped / f, stat.cb_bytes / f / 1024, stat.inst_bytes / f / 1024, stat.copied / f / 1024,
-        stat.dedupe_hits / f, stat.max_used / 1048576.0, cur >= 0 ? slots[cur].cap / 1048576.0 : 0.0);
+        stat.draws ? 100.0 * stat.motion / stat.draws : 0.0, stat.unmatched / f, stat.dropped / f, stat.cb_bytes / f / 1024, stat.inst_bytes / f / 1024, stat.copied / f / 1024,
+        stat.dedupe_hits / f, stat.max_used / 1048576.0, cur >= 0 ? slots[cur].cap / 1048576.0 : 0.0,
+        stat.motion ? 100.0 * stat.unchanged / stat.motion : 0.0);
     memset(&stat, 0, sizeof stat);
 }
 
@@ -213,6 +216,46 @@ full:
     s->used = used_before;
     stat.dropped++;
     return -1;
+}
+
+void mvec_drawn(void) { stat.motion++; }
+
+bool mvec_push(int rec, uint32_t pc[MVEC_PUSH / 4]) {
+    if (cur < 0 || prev < 0 || rec < 0 || rec >= slots[cur].nrec) return false;
+    const MvecRec *r = &slots[cur].rec[rec];
+    if (r->prev < 0) return false;
+    const MvecRec *p = &slots[prev].rec[r->prev];
+    memset(pc, 0, MVEC_PUSH);
+    bool same = true;
+    for (int k = 0; k < r->ncb; k++) {
+        int j = -1;
+        for (int m = 0; m < p->ncb; m++) if (p->cb_slot[m] == r->cb_slot[k]) j = m;
+        if (j < 0) return false;
+        int s = r->cb_slot[k] - 3;
+        pc[s] = p->cb_off[j] / 16;
+        pc[14 + s] = (p->cb_size[j] + 15) / 16;
+        same = same && p->cb_size[j] == r->cb_size[k] &&
+               !memcmp(slots[prev].ptr + p->cb_off[j], slots[cur].ptr + r->cb_off[k], r->cb_size[k]);
+    }
+    if (same) stat.unchanged++;
+    slots[prev].seq = vk_pending_seq();  // (read by this frame's draws too: kept until they are done)
+    return true;
+}
+
+VkDescriptorBufferInfo mvec_history_info(void) {
+    int i = prev >= 0 ? prev : cur;
+    return (VkDescriptorBufferInfo){i >= 0 ? slots[i].buf : VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+}
+
+float mvec_view_enabled(void) {
+    static float px;
+    static bool init;
+    if (!init) {  // (a negative value: raw, red = written, green / blue = |x| / |y| times its size)
+        init = true;
+        const char *e = getenv("SAVAGEWIND_MVEC_VIEW");
+        px = e ? (atof(e) != 0 ? (float)atof(e) : 16.0f) : 0.0f;
+    }
+    return px;
 }
 
 const MvecRec *mvec_records(bool previous, int *n, VkBuffer *history) {

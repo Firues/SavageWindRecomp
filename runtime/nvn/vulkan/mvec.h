@@ -9,6 +9,11 @@
 
 #define MVEC_CB 14    // the game's constant buffers, hardware slots 3..16
 #define MVEC_INST 4   // instanced streams copied per draw
+// A motion program's inputs (maxwell/translate.c, ShaderKey mvec): the previous frame's history buffer at this binding
+// of the vertex set, and push constants: uint pb[14] (where each constant buffer slot 3..16 starts, in 16-byte units)
+// then uint pbn[14] (its size, in 16-byte units)
+#define MVEC_HISTORY_BINDING 63
+#define MVEC_PUSH 112
 
 typedef struct { uint64_t addr, size; uint32_t stride, divisor; } MvecStream;
 
@@ -46,3 +51,12 @@ bool mvec_enabled(void);  // SAVAGEWIND_MVEC=1
 int mvec_record(const MvecDrawIn *d);
 // The current and the previous frame's records and history buffers (NULL / 0 when there is no previous frame)
 const MvecRec *mvec_records(bool previous, int *n, VkBuffer *history);
+// The push constants of the current frame's record `rec` (mvec_record's index): its match's constant buffer copies in
+// the previous frame's history. false: no match, or the match lacks a buffer this draw reads (no motion program).
+bool mvec_push(int rec, uint32_t pc[MVEC_PUSH / 4]);
+void mvec_drawn(void);  // a recorded draw was drawn with its motion program (statistics)
+// The previous frame's history buffer, for MVEC_HISTORY_BINDING (any valid buffer before there is one)
+VkDescriptorBufferInfo mvec_history_info(void);
+// SAVAGEWIND_MVEC_VIEW=<pixels>: the vectors drawn over the scene (exec.c mvec_scene_view), full colour at that length
+// (default 16; negative: raw, red = written, green / blue = |x| / |y| NDC times its size); 0 when off
+float mvec_view_enabled(void);

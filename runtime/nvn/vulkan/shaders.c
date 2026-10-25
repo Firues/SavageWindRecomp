@@ -243,6 +243,7 @@ void vk_key_normalize(const uint8_t *code, int stage, ShaderKey *k) {
         memset(k->rt_kind, 0, sizeof k->rt_kind);
         k->vs_out_mask = 0;
         k->shared_size = 0;
+        k->mvec_rt = 0;
     } else if (stage == STAGE_FRAGMENT) {
         uint32_t omap;
         memcpy(&omap, code + 0x30 + 0x48, 4);  // (4 bits per color target)
@@ -252,6 +253,7 @@ void vk_key_normalize(const uint8_t *code, int stage, ShaderKey *k) {
         memset(k->attr_kind, 0, sizeof k->attr_kind);
         k->flip_y = k->depth_minus_one = false;
         k->shared_size = 0;
+        k->mvec = 0;
     } else {
         uint32_t shared = k->shared_size;
         bool glsl = k->glsl;
@@ -786,6 +788,30 @@ static const char *builtin_src(const char *name, int *stage) {
     // path): a 3x3 neighbourhood's soft minimum and maximum set how far each pixel may be pushed away from its cross
     // neighbours, so edges sharpen without halos and flat or noisy areas stay. a.x = sharpness 0..1 (peak -1/8 ..
     // -1/5), b.xy = image size. Alpha passes through (exec.c scene_post).
+    // Motion vectors over the scene (SAVAGEWIND_MVEC_VIEW, exec.c mvec_scene_view): t0 the scene, t1 the motion target
+    // (exec.c begin_pass: NDC distance from the previous frame in .xy, .a 1 where a draw wrote one). Pixels with a
+    // vector: the scene's grey mixed with a hue for the direction, as strong as its length against a.x pixels; without
+    // one: the scene darkened and blue. b.xy: the motion target's size, b.zw: the output's.
+    if (!strcmp(name, "mvec_view.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D t1;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  vec2 uv = gl_FragCoord.xy / pc.b.zw;\n"
+               "  vec4 s = texture(t0, uv);\n"
+               "  float l = dot(s.rgb, vec3(0.299, 0.587, 0.114));\n"
+               "  vec4 m = texelFetch(t1, ivec2(uv * pc.b.xy), 0);\n"
+               "  if (pc.a.x < 0.0) { o = vec4(m.a, clamp(abs(m.xy) * -pc.a.x, 0.0, 1.0), s.a); return; }\n"
+               "  if (m.a < 0.5) { o = vec4(l * 0.3, l * 0.3, l * 0.3 + 0.2, s.a); return; }\n"
+               "  vec2 px = m.xy * 0.5 * pc.b.xy;\n"
+               "  float k = clamp(length(px) / max(pc.a.x, 0.001), 0.0, 1.0);\n"
+               "  vec3 hue = 0.5 + 0.5 * cos(atan(px.y, px.x) + vec3(0.0, 2.094, 4.189));\n"
+               "  o = vec4(mix(vec3(l * 0.6), hue, k), s.a);\n"
+               "}\n";
+    }
     if (!strcmp(name, "cas.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

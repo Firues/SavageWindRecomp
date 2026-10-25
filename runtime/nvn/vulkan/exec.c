@@ -869,6 +869,23 @@ static uint32_t tex_wh[2][64][2];
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
+// (mvec.c) the motion target's slot in the current pass (-1: none), the frame it was last cleared in
+static int pass_mvec = -1;
+static uint64_t mvec_cleared = ~0ull;
+static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f);
+static VkImageView post_view(TexBackend *d);
+// The motion target for a pass writing `depth` (minw x minh: the pass's size): the internal-resolution scene depth's
+// size (the largest RS_SCENE depth seen; its halves and levels get none), NULL for other passes
+static TexBackend *mvec_target_img;
+static TexBackend *mvec_pass_target(NvnTexture *depth, uint32_t minw, uint32_t minh) {
+    if (vk_texture_scale_group(depth) != RS_SCENE || (st.rt.has_dview && (st.rt.dview.setmask & 1) && st.rt.dview.base_level))
+        return NULL;
+    static uint32_t mw, mh;
+    if ((uint64_t)minw * minh > (uint64_t)mw * mh) mw = minw, mh = minh;
+    if (minw != mw || minh != mh) return NULL;
+    mvec_target_img = post_image(8, mw, mh, VK_FORMAT_R16G16B16A16_SFLOAT);
+    return mvec_target_img;
+}
 // (debugging) SAVAGEWIND_TRACE_TEX (textures.c): texture write histories
 bool vk_trace_tex(NvnTexture *t);
 void vk_trace_event(NvnTexture *t, uint64_t key, NvnTexture *const *srcs, int nsrcs, const char *fmt, ...);
@@ -1346,6 +1363,21 @@ static void begin_pass(void) {
         stat_passes++;
         return;
     }
+    pass_mvec = -1;
+    if (mvec_enabled() && has_d && pass_ncolor < 8 && pass_samples == 1) {  // (mvec.c) the motion target, appended
+        TexBackend *mt = mvec_pass_target(st.rt.depth, minw, minh);
+        if (mt) {
+            uint64_t frame = renderer_present_count();
+            ca[pass_ncolor] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                                                          .imageView = post_view(mt), .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                                          .loadOp = mvec_cleared == frame ? VK_ATTACHMENT_LOAD_OP_LOAD
+                                                                                          : VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                                          .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+            mvec_cleared = frame;
+            pass_color[pass_ncolor] = mt->format;
+            pass_mvec = (int)pass_ncolor++;
+        }
+    }
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
@@ -1586,12 +1618,17 @@ typedef struct {
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
 
+// The push constants of a motion vector program (mvec.c MVEC_PUSH: the history offsets of the previous frame's
+// constant buffers), in the layouts of its stages, their libraries and the program
+static const VkPushConstantRange mvec_push_range = {VK_SHADER_STAGE_VERTEX_BIT, 0, MVEC_PUSH};
+
 static VkPipelineLayout make_layout(const VkBindingInfo *binds, int nbinds, VkDescriptorSetLayout *set_layout, int nsets,
-                                    VkShaderStageFlags s0, VkShaderStageFlags s1) {
+                                    VkShaderStageFlags s0, VkShaderStageFlags s1, bool mvec) {
     set_layout[0] = vk_set_layout(binds, nbinds, 0, s0);
     if (nsets > 1) set_layout[1] = vk_set_layout(binds, nbinds, 1, s1);
     VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = (uint32_t)nsets,
-                                     .pSetLayouts = set_layout};
+                                     .pSetLayouts = set_layout, .pushConstantRangeCount = mvec ? 1u : 0u,
+                                     .pPushConstantRanges = &mvec_push_range};
     VkPipelineLayout l;
     VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l));
     return l;
@@ -1809,13 +1846,16 @@ static const ProgBuild *prog_build(const ShaderInfo *vi, const ShaderInfo *fi, b
     if (g_vk.gpl && v->set_layout && f->set_layout) {  // (the libraries' sets: "identically defined" by being the same;
         b->set_layout[0] = v->set_layout;               //  their dynamic uniform buffers were picked per stage, stage_layouts)
         b->set_layout[1] = f->set_layout;
+        bool mv = vi->mvec || fi->mvec;
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                          .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = 2,
-                                         .pSetLayouts = b->set_layout};
+                                         .pSetLayouts = b->set_layout, .pushConstantRangeCount = mv ? 1u : 0u,
+                                         .pPushConstantRanges = &mvec_push_range};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &b->layout));
     } else {
         ubo_dynamic_mark(b->binds, b->nbinds);
-        b->layout = make_layout(b->binds, b->nbinds, b->set_layout, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+        b->layout = make_layout(b->binds, b->nbinds, b->set_layout, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                vi->mvec || fi->mvec);
     }
     pthread_mutex_lock(&pb_lock);
     ProgBuild *o = pb_tab[slot];
@@ -1981,19 +2021,21 @@ static bool program_ready_now(Prog *p) {
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 
 // The last program and pipeline draw_ looked up (consecutive draws mostly repeat them; cleared by vk_exec_reset).
-static struct { uint64_t code[2]; ShaderKey vk; uint8_t rt[sizeof ((ShaderKey *)0)->rt_kind]; Prog *p; } prog_memo;
+static struct { uint64_t code[2]; ShaderKey vk; uint8_t rt[sizeof ((ShaderKey *)0)->rt_kind], mvec_rt; Prog *p; } prog_memo;
 
 static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey);
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
     if (prog_memo.p && prog_memo.code[0] == np->stages[0].code_addr && prog_memo.code[1] == np->stages[1].code_addr &&
-        !memcmp(&prog_memo.vk, vkey, sizeof *vkey) && !memcmp(prog_memo.rt, fkey->rt_kind, sizeof prog_memo.rt))
+        !memcmp(&prog_memo.vk, vkey, sizeof *vkey) && !memcmp(prog_memo.rt, fkey->rt_kind, sizeof prog_memo.rt) &&
+        prog_memo.mvec_rt == fkey->mvec_rt)
         return prog_memo.p;
     Prog *p = get_program_(np, vkey, fkey);
     prog_memo.code[0] = np->stages[0].code_addr;
     prog_memo.code[1] = np->stages[1].code_addr;
     prog_memo.vk = *vkey;
     memcpy(prog_memo.rt, fkey->rt_kind, sizeof prog_memo.rt);
+    prog_memo.mvec_rt = fkey->mvec_rt;
     prog_memo.p = p;
     return p;
 }
@@ -2004,6 +2046,7 @@ static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    h ^= fkey->mvec_rt; h *= 0x100000001B3ull;  // (a motion vector program's output: the pass's motion target slot)
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
@@ -2417,7 +2460,8 @@ static void stage_layouts(StageBuild *b, int stage) {
     VkDescriptorSetLayout sl[2] = {stage == STAGE_VERTEX ? b->set_layout : VK_NULL_HANDLE, b->set_layout};
     VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                      .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = set + 1,
-                                     .pSetLayouts = sl};
+                                     .pSetLayouts = sl, .pushConstantRangeCount = b->si->mvec ? 1u : 0u,
+                                     .pPushConstantRanges = &mvec_push_range};
     VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &b->lib_layout));
 }
 
@@ -3793,7 +3837,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             bi[n].offset = 0;
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-            bi[n] = gmem_info();
+            bi[n] = b->binding == MVEC_HISTORY_BINDING ? mvec_history_info() : gmem_info();
             w[n].pBufferInfo = &bi[n];
         } else {
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
@@ -3867,7 +3911,7 @@ static void cs_make(CsBuild *c) {
         VkShaderModule m = vk_module(spv, n);
         free(spv);
         VkDescriptorSetLayout sl[2] = {0};
-        c->layout = make_layout(c->binds, c->nbinds, sl, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
+        c->layout = make_layout(c->binds, c->nbinds, sl, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0, false);
         c->set_layout = sl[0];
         VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
         VkSpecializationInfo spec = {3, me, 12, c->local};
@@ -4246,7 +4290,7 @@ bool vk_pso_warm_compute(const ShaderInfo *si, const uint32_t local[3]) {
     VkShaderModule m = warm_module(si, STAGE_COMPUTE, binds, &nb, MAX_BIND);
     if (!m) return false;
     VkDescriptorSetLayout sl[2] = {0};
-    VkPipelineLayout l = make_layout(binds, nb, sl, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
+    VkPipelineLayout l = make_layout(binds, nb, sl, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0, false);
     VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
     VkSpecializationInfo spec = {3, me, 12, local};
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -4273,7 +4317,8 @@ bool vk_pso_warm(const ShaderInfo *vi, const ShaderInfo *fi, const uint8_t attr_
     bool ok = false;
     if (v && f) {
         VkDescriptorSetLayout sl[2] = {0};
-        VkPipelineLayout l = make_layout(binds, nb, sl, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+        VkPipelineLayout l = make_layout(binds, nb, sl, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                         vi->mvec || fi->mvec);
         PipeState s;
         memset(&s, 0, sizeof s);
         for (int a = 0; a < 32; a++) {  // (one buffer, 16 bytes an attribute: the layout does not matter)
@@ -4702,6 +4747,55 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     begin_pass();
     if (pass_void) { stat_skipped++; return; }
+    // ---- motion vectors (mvec.c): an opaque draw of a pass with the motion target is recorded (its identity and the
+    // vertex shader's inputs, for the next frame); matched with one of the previous frame, it is drawn with its motion
+    // program: the vertex shader also run on the previous frame's inputs, the fragment shader also writing the distance
+    uint32_t mvec_pc[MVEC_PUSH / 4];
+    bool mvec_draw = false;
+    // Full-screen triangles and quads that write depth (BOTW fills the scene's depth with several: sky, far plane)
+    // keep no vector: drawn after the geometry, their camera-independent positions would cover it with zeros (they get
+    // the camera's motion in the fallback).
+    bool fullscreen = r->x[2] <= 6 && st.viewport[0][2] >= pass_w * 0.9f / pass_sx && st.viewport[0][3] >= pass_h * 0.9f / pass_sy;
+    if (pass_mvec >= 0 && st.ds[0] && st.ds[1]) {
+        MvecDrawIn md = {0};
+        md.frame = renderer_present_count();
+        md.gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED);
+        md.vs = st.program->stages[0].code_addr;
+        md.fs = st.program->stages[1].code_addr;
+        md.count = (uint32_t)r->x[2];
+        if (indexed) {
+            md.iaddr = r->x[3]; md.base_vertex = (int32_t)r->x[4]; md.base_inst = (uint32_t)r->x[5];
+            md.inst = (uint32_t)r->x[6] ? (uint32_t)r->x[6] : 1;
+        } else {
+            md.first = (uint32_t)r->x[1]; md.base_inst = (uint32_t)r->x[3]; md.inst = (uint32_t)r->x[4] ? (uint32_t)r->x[4] : 1;
+        }
+        md.nstream = st.nstream;
+        for (int s = 0; s < st.nstream && s < 16; s++)
+            md.stream[s] = (MvecStream){st.vbuf[s].addr, st.vbuf[s].size, st.stream[s][0], st.stream[s][1]};
+        for (int a = 0; a < 16 && a < st.nattrib; a++)
+            if ((pr->vi->attr_mask >> a) & 1) md.vs_streams |= 1u << ((st.attrib[a] >> 8) & 0x1F);
+        for (int k = 3; k < 17 && md.ncb < MVEC_CB; k++) {  // (the game's buffers: cbuf_info's k >= 3)
+            Range u = st.ubuf[0][k - 3];
+            if (!((pr->vi->cbuf_mask >> k) & 1) || !u.addr) continue;
+            uint64_t size = pr->vi->cbuf_size[k] ? pr->vi->cbuf_size[k] : 256;
+            if ((pr->vi->cbuf_dynamic & (1u << k)) && u.size) size = u.size > 0x10000 ? 0x10000 : u.size;
+            if (size > u.size && u.size) size = u.size;
+            md.cb[md.ncb].slot = (uint8_t)k; md.cb[md.ncb].addr = u.addr; md.cb[md.ncb++].size = size;
+        }
+        int rec = mvec_record(&md);
+        if (rec >= 0 && !fullscreen && mvec_push(rec, mvec_pc)) {
+            ShaderKey mvk = {0}, mfk = {0};
+            mvk.glsl = mfk.glsl = 1;
+            mvk.flip_y = mfk.flip_y = origin == 0;
+            mvk.depth_minus_one = dmode == 0;
+            for (int i = 0; i < st.nattrib; i++) mvk.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
+            for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) mfk.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+            mvk.mvec = 1;
+            mfk.mvec_rt = (uint8_t)(pass_mvec + 1);
+            Prog *mp = get_program(st.program, &mvk, &mfk);
+            if (mp && atomic_load(&mp->state) == 1) { pr = mp; mvec_draw = true; mvec_drawn(); }  // (else built later)
+        }
+    }
     if (st.rt.depth && !depth_read_only()) pass_ds_written = true;
     for (int i = 0; i < st.rt.ncolor && i < 8; i++)
         if (st.rt.color[i] && draw_writes_color(pr, i)) {
@@ -4770,6 +4864,7 @@ static void draw_(CmdRec *r, bool indexed) {
             memcpy(k.s.blend[i] + 1, st.blend[i] + 1, 6);  // (the factors and ops; 0 is the target index, 7 padding)
         }
     }
+    if (pass_mvec >= 0 && pr->fi->mvec) k.s.write_mask[pass_mvec] = 0xF;  // (mvec.c: only motion programs write it)
     k.s.a2c = st.ms[0xC] != 0;
     k.s.topo_class = cls;
     k.s.poly_fill = st.poly[2] != 1;
@@ -4994,6 +5089,7 @@ have_pipe:
         dc.ndyn = (uint32_t)ndyn;
         memcpy(dc.dyn, dyn, (size_t)ndyn * 4);
     }
+    if (mvec_draw) vkCmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, MVEC_PUSH, mvec_pc);
 
     uint64_t prof_t2_ = profd ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)
@@ -5053,32 +5149,6 @@ have_pipe:
     if (use_index && (dc.ibuf != ib.buf || dc.ioff != ib.off || dc.itype != (uint32_t)itype_vk)) {
         vkCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
         dc.ibuf = ib.buf; dc.ioff = ib.off; dc.itype = itype_vk;
-    }
-
-    // ---- motion vectors (mvec.c): the opaque scene draws (writing depth at the internal resolution), their
-    // identity and the vertex shader's inputs, kept for the next frame
-    if (mvec_enabled() && st.rt.depth && st.ds[0] && st.ds[1] && vk_texture_scale_group(st.rt.depth) == RS_SCENE) {
-        MvecDrawIn md = {0};
-        md.frame = renderer_present_count();
-        md.gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED);
-        md.vs = st.program->stages[0].code_addr;
-        md.fs = st.program->stages[1].code_addr;
-        md.iaddr = indexed ? r->x[3] : 0;
-        md.count = count; md.first = first; md.base_vertex = base_vertex; md.inst = inst; md.base_inst = base_inst;
-        md.nstream = st.nstream;
-        for (int s = 0; s < st.nstream && s < 16; s++)
-            md.stream[s] = (MvecStream){st.vbuf[s].addr, st.vbuf[s].size, st.stream[s][0], st.stream[s][1]};
-        for (int a = 0; a < 16 && a < st.nattrib; a++)
-            if ((pr->vi->attr_mask >> a) & 1) md.vs_streams |= 1u << ((st.attrib[a] >> 8) & 0x1F);
-        for (int k = 3; k < 17 && md.ncb < MVEC_CB; k++) {  // (the game's buffers: cbuf_info's k >= 3)
-            Range u = st.ubuf[0][k - 3];
-            if (!((pr->vi->cbuf_mask >> k) & 1) || !u.addr) continue;
-            uint64_t size = pr->vi->cbuf_size[k] ? pr->vi->cbuf_size[k] : 256;
-            if ((pr->vi->cbuf_dynamic & (1u << k)) && u.size) size = u.size > 0x10000 ? 0x10000 : u.size;
-            if (size > u.size && u.size) size = u.size;
-            md.cb[md.ncb].slot = (uint8_t)k; md.cb[md.ncb].addr = u.addr; md.cb[md.ncb++].size = size;
-        }
-        mvec_record(&md);
     }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
@@ -5715,7 +5785,7 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
 // Post image `i` at w x h in format f (kept until the size or format changes). 0, 1: SMAA edges / weights, 2: SMAA
 // output, 3, 4: FSR EASU / RCAS of the presented image; 5, 6: FSR EASU / RCAS of the 3D scene, 7: its CAS
 // sharpening (scene_post).
-enum { POST_IMAGES = 8 };
+enum { POST_IMAGES = 10 };  // (8: the motion target, 9: its view: mvec)
 static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f) {
     static TexBackend img[POST_IMAGES];
     TexBackend *d = &img[i];
@@ -5883,8 +5953,10 @@ static NvnTexture *scene_composite(Prog *pr, CmdRec *r) {
     return NULL;
 }
 
+static bool mvec_scene_view(Prog *pr, CmdRec *r);
 static void scene_post(Prog *pr, CmdRec *r) {
     scene_up.t = NULL;
+    if (mvec_view_enabled() != 0 && mvec_scene_view(pr, r)) return;
     static int fsr_on = -1, cas_on = -1;
     if (fsr_on < 0) fsr_on = getenv("SAVAGEWIND_SCENE_FSR") ? atoi(getenv("SAVAGEWIND_SCENE_FSR")) : 1;
     if (cas_on < 0) cas_on = getenv("SAVAGEWIND_SCENE_CAS") ? atoi(getenv("SAVAGEWIND_SCENE_CAS")) : 1;
@@ -6253,6 +6325,39 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
     fg.hudless_ok = fg.copy_pending = false;
     fg.out_rt = fg.scene = NULL;
     return out;
+}
+
+// (mvec.c, SAVAGEWIND_MVEC_VIEW) At the scene composite (scene_post's detection): the motion target drawn over the
+// scene (shaders.c mvec_view.frag) into an image the composite samples instead of the scene (scene_up)
+static bool mvec_scene_view(Prog *pr, CmdRec *r) {
+    NvnTexture *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
+    if (!mvec_target_img || !rt || r->x[2] > 6 || !pr->fi->ntex || vk_texture_scale_group(rt) != RS_OUT) return false;
+    const float *vp = st.viewport[0];
+    if (vp[2] < rt->width * 0.5f || vp[3] < rt->height * 0.5f) return false;
+    for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        if (!t || t->target != 1 || vk_texture_scale_group(t) != RS_SCENE || t->width * 2 < vp[2] || t->height * 2 < vp[3]) continue;
+        TexBackend *b = vk_tex(t, false);
+        if (!b->image || b->layers != 1 || b->samples != 1 || b->depth != 1 || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) continue;
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) continue;
+        vk_end_pass();
+        VkCommandBuffer cb = vk_cmd();
+        static const VkComponentMapping id = {0};
+        VkImageView src = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+        TexBackend *o = post_image(9, b->width, b->height, b->format);
+        float pc[8] = {mvec_view_enabled(), 0, 0, 0, (float)mvec_target_img->width, (float)mvec_target_img->height,
+                       (float)b->width, (float)b->height};
+        VkImageView in[3] = {src, post_view(mvec_target_img)};
+        post_pass(cb, "mvec_view.frag", in, 2, o, pc, false);
+        vk_full_barrier(cb);
+        scene_up.t = t;
+        scene_up.img = o;
+        scene_up.sx = scene_up.sy = 1;
+        return true;
+    }
+    return false;
 }
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
