@@ -791,7 +791,9 @@ static const char *builtin_src(const char *name, int *stage) {
     // Motion vectors over the scene (SAVAGEWIND_MVEC_VIEW, exec.c mvec_scene_view): t0 the scene, t1 the motion vectors
     // (exec.c mvec_fill: NDC distance from the previous frame in .xy; .a 1 for a draw's own vector, 0.5 for the camera's,
     // 0 for none). The scene's grey mixed with a hue for the direction, as strong as the length against a.x pixels;
-    // camera vectors hatched; no vector: the scene darkened and blue. a.x < 0: raw (red = .a, green / blue = |x| / |y|
+    // camera vectors hatched; no vector: the scene darkened and blue; the reactive mask (.z, 4x: effects are faint)
+    // magenta over them. a.x < 0:
+    // raw (red = .a, green / blue = |x| / |y|
     // times -a.x). b.xy: the motion vectors' size, b.zw: the output's.
     if (!strcmp(name, "mvec_view.frag")) {
         *stage = STAGE_FRAGMENT;
@@ -812,6 +814,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "  vec3 hue = 0.5 + 0.5 * cos(atan(px.y, px.x) + vec3(0.0, 2.094, 4.189));\n"
                "  vec3 c = mix(vec3(l * 0.6), hue, k);\n"
                "  if (m.a < 0.75 && ((int(gl_FragCoord.x + gl_FragCoord.y) >> 3) & 1) != 0) c = mix(c, vec3(l * 0.6), 0.65);\n"
+               "  c = mix(c, vec3(1.0, 0.25, 1.0), clamp(m.z * 4.0, 0.0, 1.0) * 0.8);\n"
                "  o = vec4(c, s.a);\n"
                "}\n";
     }
@@ -842,7 +845,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "  float d = texelFetch(t1, p, 0).r;\n"
                "  vec4 q = pc.m * vec4(clip.x, clip.y * pc.a.x, pc.a.y != 0.0 ? d * 2.0 - 1.0 : d, 1.0);\n"
                "  vec2 prev = vec2(q.x, q.y * pc.a.x) / q.w;\n"
-               "  o = pc.a.z == 2.0 ? vec4(clip - prev - v.xy, 0.0, 1.0) : vec4(clip - prev - jit, 0.0, 0.5);\n"
+               "  o = pc.a.z == 2.0 ? vec4(clip - prev - v.xy, 0.0, 1.0) : vec4(clip - prev - jit, v.z, 0.5);\n"
                "}\n";
     }
     if (!strcmp(name, "cas.frag")) {

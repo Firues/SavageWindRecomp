@@ -2183,14 +2183,15 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     glsl_rewrite(c, &body, c->body.buf ? c->body.buf : "");
     // motion vectors (key->mvec, key->mvec_rt): see shader.h
     bool mvec = stage == STAGE_VERTEX && key && key->mvec && !dbg;
-    int mvec_rt = stage == STAGE_FRAGMENT && key && !dbg ? key->mvec_rt - 1 : -1;
+    int mvec_rt = stage == STAGE_FRAGMENT && key && !dbg ? (key->mvec_rt & 0x7F) - 1 : -1;
+    bool mvec_mask = mvec_rt >= 0 && (key->mvec_rt & 0x80);  // (the reactive mask: no vector, no mv_cur / mv_prev)
     if (mvec) {
         if (c->out_attr_mask >> 30) fail(c, "mvec: varyings 30 / 31 in use");
         c->rw_prev = true;
         glsl_rewrite(c, &pbody, c->body.buf ? c->body.buf : "");
         c->rw_prev = false;
     }
-    if (mvec_rt >= 0 && ((c->in_attr_mask >> 30) || ((c->omap_target >> (mvec_rt * 4)) & 0xF)))
+    if (mvec_rt >= 0 && ((!mvec_mask && (c->in_attr_mask >> 30)) || ((c->omap_target >> (mvec_rt * 4)) & 0xF)))
         fail(c, "mvec: input 30 / 31 or color %d in use", mvec_rt);
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
     if (info->cbuf_mask >> 18) fail(c, "cbuf index out of range");
@@ -2263,9 +2264,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             sp(&s, "layout(location = %d) out %s c%d;\n", rt, kind == 1 ? "ivec4" : kind == 2 ? "uvec4" : "vec4", rt);
         }
         if (c->omap_depth) info->writes_depth = true;
-        if (mvec_rt >= 0)
-            sp(&s, "layout(location = 30) in vec4 mv_cur;\nlayout(location = 31) in vec4 mv_prev;\n"
-                   "layout(location = %d) out vec4 mv_out;\n", mvec_rt);
+        if (mvec_rt >= 0 && !mvec_mask) sp(&s, "layout(location = 30) in vec4 mv_cur;\nlayout(location = 31) in vec4 mv_prev;\n");
+        if (mvec_rt >= 0) sp(&s, "layout(location = %d) out vec4 mv_out;\n", mvec_rt);
     } else {
         sp(&s, "layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
         if (c->uses_shared) sp(&s, "shared uint smem[%u];\n", c->smem_words);
@@ -2321,13 +2321,18 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             if (c->reg_used[r + 1]) sp(&s, "  gl_FragDepth = as_f(r%d);\n", r + 1);
             else sp(&s, "  gl_FragDepth = gl_FragCoord.z;\n");
         }
-        if (mvec_rt >= 0)  // NDC from the previous frame's position to this one's (both after the y flip)
+        if (mvec_mask) {  // the reactive mask: the effect's coverage (its alpha, when it writes one as a float)
+            bool alpha = (c->omap_target & 0x8) && (!key || key->rt_kind[0] == 0);
+            sp(&s, "  mv_out = vec4(0.0f, 0.0f, %s, 0.0f);\n", alpha ? "clamp(c0.a, 0.0f, 1.0f)" : "1.0f");
+        } else if (mvec_rt >= 0) {  // NDC from the previous frame's position to this one's (both after the y flip)
             sp(&s, "  mv_out = vec4(mv_cur.xy / mv_cur.w - mv_prev.xy / mv_prev.w, 0.0f, 1.0f);\n");
+        }
     }
     sp(&s, "}\n");
     info->msl = glsl_with_prelude(s.buf);
     free(s.buf);
-    info->mvec = mvec || mvec_rt >= 0;
+    info->mvec = mvec || (mvec_rt >= 0 && !mvec_mask);
+    info->mvec_mask = mvec_mask;
     info->attr_mask = c->in_attr_mask;
     info->out_mask = stage == STAGE_FRAGMENT ? c->omap_target : c->out_attr_mask;
     free(c->body.buf);

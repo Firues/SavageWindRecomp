@@ -4801,6 +4801,20 @@ static void draw_(CmdRec *r, bool indexed) {
             if (mp && atomic_load(&mp->state) == 1) { pr = mp; mvec_draw = true; mvec_drawn(); }  // (else built later)
         }
     }
+    // ---- reactive mask (mvec.c): a blended effect in a pass with the motion target (not writing depth, not full-screen:
+    // those are BOTW's fog and light composites) marks its pixels in the motion target's .z (its alpha, kept by MAX), for
+    // a temporal upscaler to trust its history less there
+    if (pass_mvec >= 0 && !(st.ds[0] && st.ds[1]) && (st.color_state[0] & 1) && !fullscreen) {
+        ShaderKey mvk = {0}, mfk = {0};
+        mvk.glsl = mfk.glsl = 1;
+        mvk.flip_y = mfk.flip_y = origin == 0;
+        mvk.depth_minus_one = dmode == 0;
+        for (int i = 0; i < st.nattrib; i++) mvk.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
+        for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) mfk.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+        mfk.mvec_rt = (uint8_t)(0x80 | (pass_mvec + 1));
+        Prog *mp = get_program(st.program, &mvk, &mfk);
+        if (mp && atomic_load(&mp->state) == 1) pr = mp, mvec_masked();  // (else built for the next frames)
+    }
     if (st.rt.depth && !depth_read_only()) pass_ds_written = true;
     for (int i = 0; i < st.rt.ncolor && i < 8; i++)
         if (st.rt.color[i] && draw_writes_color(pr, i)) {
@@ -4870,6 +4884,12 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
     if (pass_mvec >= 0 && pr->fi->mvec) k.s.write_mask[pass_mvec] = 0xF;  // (mvec.c: only motion programs write it)
+    if (pass_mvec >= 0 && pr->fi->mvec_mask) {  // (the reactive mask: .z alone, the strongest effect kept)
+        static const uint8_t max_blend[8] = {0, 2, 2, 2, 2, 5, 5, 0};  // (ONE, ONE, MAX: blend_factor, blend_op)
+        k.s.write_mask[pass_mvec] = 0x4;
+        k.s.blend_on |= (uint8_t)(1u << pass_mvec);
+        memcpy(k.s.blend[pass_mvec], max_blend, 8);
+    }
     k.s.a2c = st.ms[0xC] != 0;
     k.s.topo_class = cls;
     k.s.poly_fill = st.poly[2] != 1;

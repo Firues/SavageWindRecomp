@@ -47,8 +47,9 @@ typedef struct {
                             // the body run first with its constant buffers read from the history buffer, both clip
                             // positions to mv_cur / mv_prev (locations 30, 31)
     uint8_t mvec_rt;        // fragment (GLSL): 1 + the color location the motion vector goes to (0: none), from mv_cur /
-                            // mv_prev: the NDC distance from the previous position (in the padding: the key's size and
-                            // layout are unchanged)
+                            // mv_prev: the NDC distance from the previous position; with 0x80: the reactive mask instead
+                            // (.z: how much this blended effect covers the pixel, its alpha; no vector) (in the padding:
+                            // the key's size and layout are unchanged)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
     uint32_t shared_size;   // compute: shared memory bytes (from the program's control section)
@@ -74,6 +75,7 @@ typedef struct {
     bool writes_depth, uses_discard, writes_point_size;
     bool mvec;              // a motion vector variant (ShaderKey mvec / mvec_rt): its pipeline layout has the push
                             // constants of the history offsets (vulkan/mvec.c, MVEC_PUSH)
+    bool mvec_mask;         // a reactive mask variant (ShaderKey mvec_rt with 0x80): writes the motion target's .z only
     bool uses_gmem;         // global memory access: bind the guest heap at GMEM_BUFFER_INDEX
     bool writes_gmem;       // ... and stores to it (STG)
     bool uses_tint;         // fragment: reads the per-draw tint (buffer 19, float4[2]) applied to color target 0

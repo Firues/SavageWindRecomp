@@ -74,7 +74,8 @@ const MvecRec *mvec_records(bool previous, int *n, VkBuffer *history);
 // The push constants of the current frame's record `rec` (mvec_record's index): its match's constant buffer copies in
 // the previous frame's history. false: no match, or the match lacks a buffer this draw reads (no motion program).
 bool mvec_push(int rec, uint32_t pc[MVEC_PUSH / 4]);
-void mvec_drawn(void);  // a recorded draw was drawn with its motion program (statistics)
+void mvec_drawn(void);
+void mvec_masked(void);  // a blended effect was drawn with its reactive mask program (statistics)  // a recorded draw was drawn with its motion program (statistics)
 // The previous frame's history buffer, for MVEC_HISTORY_BINDING (any valid buffer before there is one)
 VkDescriptorBufferInfo mvec_history_info(void);
 // SAVAGEWIND_MVEC_VIEW=<pixels>: the vectors drawn over the scene (exec.c mvec_scene_view), full colour at that length

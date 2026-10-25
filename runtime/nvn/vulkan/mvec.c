@@ -62,6 +62,7 @@ static struct {  // since the last log line
     // moved more than 1 cm since its match, matched by fingerprint and as draw order alone would have: mismatches look
     // like jumps (most of the world stands still)
     uint64_t moved_checked, moved_order, moved_fp;
+    uint64_t masked;  // blended effects drawn into the reactive mask
     uint64_t frames, draws, matched, repeated, unmatched, dropped, cb_bytes, inst_bytes, copied, dedupe_hits, max_used, motion,
         cameras;    // frames with a valid camera (camera_finish)
 } stat;
@@ -192,11 +193,12 @@ static void log_stats(uint64_t frame) {
     LOG("[mvec] frame %llu: %.0f scene draws a frame, matched %.1f%% (%.0f with a repeated key, %.1f%% drawn with motion), "
         "unmatched %.0f, "
         "not recorded %.0f; inputs %.0f KB constants + %.0f KB instance data a frame, %.0f KB copied (%.0f copies "
-        "shared); history slot at most %.1f MB used of %.1f; camera found in %.0f%% of the frames\n",
+        "shared); history slot at most %.1f MB used of %.1f; camera found in %.0f%% of the frames; %.1f effects a frame in "
+        "the reactive mask\n",
         (unsigned long long)frame, stat.draws / f, stat.draws ? 100.0 * stat.matched / stat.draws : 0.0, stat.repeated / f,
         stat.draws ? 100.0 * stat.motion / stat.draws : 0.0, stat.unmatched / f, stat.dropped / f, stat.cb_bytes / f / 1024, stat.inst_bytes / f / 1024, stat.copied / f / 1024,
         stat.dedupe_hits / f, stat.max_used / 1048576.0, cur >= 0 ? slots[cur].cap / 1048576.0 : 0.0,
-        100.0 * stat.cameras / f);
+        100.0 * stat.cameras / f, stat.masked / f);
     for (int g = 0; g < 2; g++)
         LOG("[mvec]   fingerprint distances, keys with %s: %.0f < 1e-4, %.0f < 1e-3, %.0f < 0.01, %.0f < 0.05, %.0f < 0.2, "
             "%.0f more%s", g ? "several candidates" : "one candidate", stat.dist_hist[g][0] / f, stat.dist_hist[g][1] / f,
@@ -430,6 +432,7 @@ full:
 }
 
 void mvec_drawn(void) { stat.motion++; }
+void mvec_masked(void) { stat.masked++; }
 
 bool mvec_push(int rec, uint32_t pc[MVEC_PUSH / 4]) {
     if (cur < 0 || prev < 0 || rec < 0 || rec >= slots[cur].nrec) return false;
