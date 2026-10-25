@@ -48,8 +48,19 @@ static int cur = -1, prev = -1;  // slots of the frame being recorded and of the
 static uint64_t cur_frame = ~0ull;
 static Dedupe dedupe[DEDUPE];
 static Index prev_index[INDEX], ord_index[INDEX];
+// The previous frame's records sorted by key (pkeys: their keys, pidx: their indices), and which are taken
+static uint64_t *pkeys;
+static int32_t *pidx;
+static bool *ptaken;
+static int npk, cap_pk;
 
 static struct {  // since the last log line
+    uint64_t dist_hist[2][6];  // chosen matches' fingerprint distances: [key with one candidate / several][bucket]
+    uint64_t not_ordinal;      // matches the draw order alone would have made differently
+    // draws with the scene shaders' layout (camera block at slot 3, the object's 3x4 world matrix at slot 4) whose object
+    // moved more than 1 cm since its match, matched by fingerprint and as draw order alone would have: mismatches look
+    // like jumps (most of the world stands still)
+    uint64_t moved_checked, moved_order, moved_fp;
     uint64_t frames, draws, matched, repeated, unmatched, dropped, cb_bytes, inst_bytes, copied, dedupe_hits, max_used, motion,
         unchanged,  // motion draws whose previous constants are the same bytes as the current ones
         cameras;    // frames with a valid camera (camera_finish)
@@ -187,8 +198,25 @@ static void log_stats(uint64_t frame) {
         stat.draws ? 100.0 * stat.motion / stat.draws : 0.0, stat.unmatched / f, stat.dropped / f, stat.cb_bytes / f / 1024, stat.inst_bytes / f / 1024, stat.copied / f / 1024,
         stat.dedupe_hits / f, stat.max_used / 1048576.0, cur >= 0 ? slots[cur].cap / 1048576.0 : 0.0,
         stat.motion ? 100.0 * stat.unchanged / stat.motion : 0.0, 100.0 * stat.cameras / f);
+    for (int g = 0; g < 2; g++)
+        LOG("[mvec]   fingerprint distances, keys with %s: %.0f < 1e-4, %.0f < 1e-3, %.0f < 0.01, %.0f < 0.05, %.0f < 0.2, "
+            "%.0f more%s", g ? "several candidates" : "one candidate", stat.dist_hist[g][0] / f, stat.dist_hist[g][1] / f,
+            stat.dist_hist[g][2] / f, stat.dist_hist[g][3] / f, stat.dist_hist[g][4] / f, stat.dist_hist[g][5] / f,
+            g ? "" : "\n");
+    LOG("; %.0f a frame matched differently than by draw order\n", stat.not_ordinal / f);
+    LOG("[mvec]   of %.0f draws with a world matrix, moved > 1 cm: %.1f matched by fingerprint (%.1f by draw order)\n",
+        stat.moved_checked / f, stat.moved_fp / f, stat.moved_order / f);
     memset(&stat, 0, sizeof stat);
 }
+
+static const Slot *sort_prev;  // (cmp_by_key's records)
+static int cmp_by_key(const void *a, const void *b) {
+    const MvecRec *x = &sort_prev->rec[*(const int32_t *)a], *y = &sort_prev->rec[*(const int32_t *)b];
+    if (x->key != y->key) return x->key < y->key ? -1 : 1;
+    return *(const int32_t *)a < *(const int32_t *)b ? -1 : *(const int32_t *)a > *(const int32_t *)b;
+}
+
+static int32_t prev_match(MvecRec *r);
 
 // A new presented frame: the slot it records into, the previous frame's index
 static void frame_begin(uint64_t frame) {
@@ -217,6 +245,59 @@ static void frame_begin(uint64_t frame) {
         while (prev_index[h].rec >= 0) h = (h + 1) & (INDEX - 1);
         prev_index[h] = (Index){r->key, r->ord, i};
     }
+    npk = slots[prev].nrec;  // (by key: each key's candidates together, in draw order)
+    if (npk > cap_pk) {
+        cap_pk = npk * 2;
+        pkeys = realloc(pkeys, (size_t)cap_pk * sizeof *pkeys);
+        pidx = realloc(pidx, (size_t)cap_pk * sizeof *pidx);
+        ptaken = realloc(ptaken, (size_t)cap_pk * sizeof *ptaken);
+    }
+    for (int i = 0; i < npk; i++) pidx[i] = i;
+    sort_prev = &slots[prev];
+    qsort(pidx, (size_t)npk, sizeof *pidx, cmp_by_key);
+    for (int i = 0; i < npk; i++) pkeys[i] = slots[prev].rec[pidx[i]].key;
+    memset(ptaken, 0, (size_t)npk * sizeof *ptaken);
+}
+
+// How far apart two fingerprints are: the mean relative difference of their values (0 equal, 1 unrelated); values
+// that are no finite floats (integers, flags) count as equal or different by their bits
+static float fingerprint_distance(const MvecRec *a, const MvecRec *b) {
+    int n = a->nfeat < b->nfeat ? a->nfeat : b->nfeat;
+    if (!n || a->nfeat != b->nfeat) return 1;
+    float d = 0;
+    for (int i = 0; i < n; i++) {
+        float x = a->feat[i], y = b->feat[i];
+        if (!isfinite(x) || !isfinite(y)) { d += memcmp(&x, &y, 4) ? 1.0f : 0.0f; continue; }
+        float s = fabsf(x) + fabsf(y);
+        d += s > 1e-6f ? fabsf(x - y) / s : 0.0f;
+    }
+    return d / (float)n;
+}
+
+// The previous frame's record for a draw: among the ones with its key and not taken yet, the nearest fingerprint
+static int32_t prev_match(MvecRec *r) {
+    if (prev < 0 || !npk) return -1;
+    int lo = 0, hi = npk;
+    while (lo < hi) { int m = (lo + hi) / 2; if (pkeys[m] < r->key) lo = m + 1; else hi = m; }
+    int best = -1, ncand = 0;
+    float bd = 2;
+    for (int i = lo; i < npk && pkeys[i] == r->key; i++) {
+        ncand++;
+        if (ptaken[i]) continue;
+        float d = fingerprint_distance(r, &slots[prev].rec[pidx[i]]);
+        if (d < bd) bd = d, best = i;
+    }
+    if (best < 0) return -1;
+    static float limit = -1;  // SAVAGEWIND_MVEC_MATCH_LIMIT: the largest fingerprint distance of a match (default 0.2)
+    if (limit < 0) limit = getenv("SAVAGEWIND_MVEC_MATCH_LIMIT") ? (float)atof(getenv("SAVAGEWIND_MVEC_MATCH_LIMIT")) : 0.2f;
+    if (bd >= limit) { stat.dist_hist[ncand > 1][5]++; return -1; }  // (a new object: the camera's vector)
+    ptaken[best] = true;
+    r->dist = bd;
+    static const float edges[5] = {1e-4f, 1e-3f, 0.01f, 0.05f, 0.2f};
+    int bucket = 0;
+    while (bucket < 5 && bd >= edges[bucket]) bucket++;
+    stat.dist_hist[ncand > 1][bucket]++;
+    return pidx[best];
 }
 
 static int32_t prev_lookup(uint64_t key, uint32_t ord) {
@@ -305,9 +386,30 @@ int mvec_record(const MvecDrawIn *d) {
         r->cb_size[r->ncb++] = (uint32_t)d->cb[k].size;
         stat.cb_bytes += d->cb[k].size;
     }
+    for (int k = 0; k < d->ncb && r->nfeat + 12 <= MVEC_FEAT; k++) {  // (the fingerprint, from guest memory as it is now)
+        if (!d->cb[k].addr || d->cb[k].size < 48) continue;
+        memcpy(&r->feat[r->nfeat], (const void *)(uintptr_t)d->cb[k].addr, 48);
+        r->nfeat += 12;
+    }
     r->key = key;
     r->ord = next_ordinal(key);
-    r->prev = prev_lookup(key, r->ord);
+    static int by_order = -1;  // SAVAGEWIND_MVEC_MATCH=order: (testing) match by draw order alone
+    if (by_order < 0) by_order = getenv("SAVAGEWIND_MVEC_MATCH") && !strcmp(getenv("SAVAGEWIND_MVEC_MATCH"), "order");
+    r->prev = by_order ? prev_lookup(key, r->ord) : prev_match(r);
+    {  // (statistics) the object's world position (slot 4's translation) against each matching's previous draw
+        int32_t po = prev_lookup(key, r->ord), pf = by_order ? -1 : r->prev;
+        if (r->nfeat >= 24 && r->cb_slot[0] == 3 && r->cb_slot[1] == 4 && po >= 0 && pf >= 0) {
+            stat.moved_checked++;
+            const float *t = &r->feat[12];
+            for (int m = 0; m < 2; m++) {
+                const MvecRec *q = &slots[prev].rec[m ? pf : po];
+                if (q->nfeat < 24) continue;
+                float dx = t[3] - q->feat[15], dy = t[7] - q->feat[19], dz = t[11] - q->feat[23];
+                if (dx * dx + dy * dy + dz * dz > 1e-4f) { if (m) stat.moved_fp++; else stat.moved_order++; }
+            }
+        }
+    }
+    if (r->prev >= 0 && r->prev != prev_lookup(key, r->ord)) stat.not_ordinal++;
     if (r->ord) stat.repeated++;
     if (r->prev >= 0) stat.matched++;
     else stat.unmatched++;

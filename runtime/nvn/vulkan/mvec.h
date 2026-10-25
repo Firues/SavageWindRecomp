@@ -9,6 +9,7 @@
 
 #define MVEC_CB 14    // the game's constant buffers, hardware slots 3..16
 #define MVEC_INST 4   // instanced streams copied per draw
+#define MVEC_FEAT 48  // a draw's fingerprint: the first 12 floats of each of its first 4 constant buffers
 // A motion program's inputs (maxwell/translate.c, ShaderKey mvec): the previous frame's history buffer at this binding
 // of the vertex set, and push constants: uint pb[14] (where each constant buffer slot 3..16 starts, in 16-byte units)
 // then uint pbn[14] (its size, in 16-byte units)
@@ -38,6 +39,9 @@ typedef struct {
     uint64_t key;
     uint32_t ord;   // among this frame's draws with the same key, in draw order
     int32_t prev;   // the matching record of the previous frame, -1: none
+    float dist;     // its fingerprint's distance from that record's (mvec.c fingerprint_distance)
+    uint8_t nfeat;
+    float feat[MVEC_FEAT];  // the fingerprint: what tells apart draws of one key (the object's own constants)
     uint8_t ncb, ninst;
     uint8_t cb_slot[MVEC_CB];
     uint32_t cb_off[MVEC_CB], cb_size[MVEC_CB];
