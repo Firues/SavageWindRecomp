@@ -121,6 +121,36 @@ The raw log lines are in the appendix.
    are ordered.
 6. **Cost:** bytes of constants and instance data kept per frame (memory for one extra frame of copies).
 
+## Answers from the implementation (TAA, desktop, Great Plateau)
+
+Measured with TAA on (Video > Anti-aliasing), a reprojection error view (the previous frame warped by the vectors,
+minus this one, x4) and the jitter off (`SAVAGEWIND_JITTER=0`), so only vector errors show.
+
+- **Vectors:** the error is lowest at the vectors' own scale and sign (mean 0.39 against 0.53-0.57 at -1, 0 and 2);
+  sky, far terrain, rocks and Link are near zero. What is left is thin grass blades and leaves uncovering what was
+  behind them (no vector can say what was there; TAA's neighbourhood clamp is what handles it) and outlines.
+- **Vertex shader textures (2):** ~1450 of ~2100 scene draws a frame have vertex shaders that sample textures; the
+  only other buffer they read outside slots 3-16 is slot 1 (the shader's own compiler constants: static). Seven
+  textures they read are drawn by the GPU every frame (a 512x512 RGBA8 linear target, a 256x256 RG8 one, 128-192
+  RGBA8 / RGBA16 levels). Giving the previous frame's copy of the vertex shader those textures' previous contents (a
+  copy before each frame's first pass into them, 8 a frame, 63% of the lookups) changed the error by nothing beyond
+  noise, standing still (grass in the wind) and moving: the grass's motion comes from its constants, which the history
+  already has. Not kept.
+- **Instance data (1):** ~3 instanced draws a frame get a motion program, 1-2 of their streams (~2 KB) change from
+  frame to frame. Not worth previous-frame vertex inputs (a second vertex binding and attribute set in every pipeline
+  of those draws).
+- **Matching (3):** the fingerprint is the first 12 floats of the draw's first 4 constant buffers after the camera
+  block (slot 3, which every scene draw shares). With the camera block in it, no fingerprint equalled its match's
+  while the camera moved and the search never stopped early; without it, recording costs 0.68 ms of CPU a frame for
+  ~2300 draws (was 0.90) and matches to another object (a world position jump over 1 cm) are 5-9 a frame in a pan, 0
+  standing still.
+- **Cost (6):** ~2.3 MB of constants a frame go through the history, ~240 KB copied (the rest shared within a
+  submission), a few KB of instance data; the history slots (5, one per frame in flight) start at 2 MB (0.2-0.5 MB
+  used) and grow when a frame fills one. Uncapped at 4K: 81.6 fps with TAA, 94.1 with SMAA; the GPU side is ~0.6 ms a frame (the geometry pass's doubled vertex work and the motion target),
+  the rest is CPU (recording, the motion program lookup, push constants).
+- **Shader compiles:** the motion variants go into the precompile key log like any other; with the cache warm, a TAA
+  run compiles nothing in play and world entry peaks at 67-108 ms (75-191 without TAA).
+
 ## Reproducing
 
 The instrumentation (`SAVAGEWIND_MV_SPIKE=1`, `[mv]` log lines) was a throwaway commit, not part of this branch: the

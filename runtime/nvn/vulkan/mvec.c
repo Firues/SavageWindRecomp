@@ -26,7 +26,7 @@
 #include "mvec.h"
 
 #define MVEC_SLOTS 5
-#define HIST_START (16ull << 20)
+#define HIST_START (2ull << 20)  // (the Great Plateau uses ~0.3 MB a frame; a fuller frame grows it, losing one frame's motion)
 #define DEDUPE 8192  // copies of one (address, size, generation) shared within a frame
 #define INDEX 32768  // (key, ordinal) -> record of the previous frame; key -> draws so far in the current frame
 
