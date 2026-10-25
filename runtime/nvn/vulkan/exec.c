@@ -4787,7 +4787,8 @@ static void draw_(CmdRec *r, bool indexed) {
             md.cb[md.ncb].slot = (uint8_t)k; md.cb[md.ncb].addr = u.addr; md.cb[md.ncb++].size = size;
         }
         int rec = mvec_record(&md);
-        if (rec >= 0 && !fullscreen && mvec_push(rec, mvec_pc)) {
+        bool pushed = rec >= 0 && !fullscreen && mvec_push(rec, mvec_pc);
+        if (pushed) {
             ShaderKey mvk = {0}, mfk = {0};
             mvk.glsl = mfk.glsl = 1;
             mvk.flip_y = mfk.flip_y = origin == 0;

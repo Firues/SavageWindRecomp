@@ -9,7 +9,8 @@
 // buffers (bones and per-object matrices included: no scene vertex shader reads global memory) and the instanced
 // streams (rewritten every frame, in place). Per-vertex streams are not: the game never rewrites them between frames.
 //
-// History buffers: MVEC_SLOTS host-visible buffers, one per frame in flight and the frame being recorded, each
+// History buffers (write-combined, often across the PCIe BAR: the CPU writes them and must never read them back, which
+// took 17 us a draw): MVEC_SLOTS host-visible buffers, one per frame in flight and the frame being recorded, each
 // holding one frame's copies; a frame's copies are read again during the next frame (as "previous"), so a slot is
 // reused only once the GPU is done with the frames that read it. A frame that fills its slot stops recording (its
 // remaining draws get no motion) and the slot is grown before its next use.
@@ -62,7 +63,6 @@ static struct {  // since the last log line
     // like jumps (most of the world stands still)
     uint64_t moved_checked, moved_order, moved_fp;
     uint64_t frames, draws, matched, repeated, unmatched, dropped, cb_bytes, inst_bytes, copied, dedupe_hits, max_used, motion,
-        unchanged,  // motion draws whose previous constants are the same bytes as the current ones
         cameras;    // frames with a valid camera (camera_finish)
 } stat;
 // The frame's slot-3 copies by guest address (the camera block: the one most draws read, camera_finish)
@@ -192,12 +192,11 @@ static void log_stats(uint64_t frame) {
     LOG("[mvec] frame %llu: %.0f scene draws a frame, matched %.1f%% (%.0f with a repeated key, %.1f%% drawn with motion), "
         "unmatched %.0f, "
         "not recorded %.0f; inputs %.0f KB constants + %.0f KB instance data a frame, %.0f KB copied (%.0f copies "
-        "shared); history slot at most %.1f MB used of %.1f; %.1f%% of the motion draws with unchanged constants; camera "
-        "found in %.0f%% of the frames\n",
+        "shared); history slot at most %.1f MB used of %.1f; camera found in %.0f%% of the frames\n",
         (unsigned long long)frame, stat.draws / f, stat.draws ? 100.0 * stat.matched / stat.draws : 0.0, stat.repeated / f,
         stat.draws ? 100.0 * stat.motion / stat.draws : 0.0, stat.unmatched / f, stat.dropped / f, stat.cb_bytes / f / 1024, stat.inst_bytes / f / 1024, stat.copied / f / 1024,
         stat.dedupe_hits / f, stat.max_used / 1048576.0, cur >= 0 ? slots[cur].cap / 1048576.0 : 0.0,
-        stat.motion ? 100.0 * stat.unchanged / stat.motion : 0.0, 100.0 * stat.cameras / f);
+        100.0 * stat.cameras / f);
     for (int g = 0; g < 2; g++)
         LOG("[mvec]   fingerprint distances, keys with %s: %.0f < 1e-4, %.0f < 1e-3, %.0f < 0.01, %.0f < 0.05, %.0f < 0.2, "
             "%.0f more%s", g ? "several candidates" : "one candidate", stat.dist_hist[g][0] / f, stat.dist_hist[g][1] / f,
@@ -274,16 +273,25 @@ static float fingerprint_distance(const MvecRec *a, const MvecRec *b) {
     return d / (float)n;
 }
 
-// The previous frame's record for a draw: among the ones with its key and not taken yet, the nearest fingerprint
+// The previous frame's record for a draw: among the ones with its key and not taken yet, the nearest fingerprint.
+// Culling shifts a key's draws by a few places, not hundreds: the search starts at the draw's own place in the key's
+// order and looks MATCH_WINDOW places either way (a key can have hundreds of draws: comparing all of them took ~40 us a
+// draw), and stops at an identical fingerprint (a still object, the most common case).
+#define MATCH_WINDOW 24
 static int32_t prev_match(MvecRec *r) {
     if (prev < 0 || !npk) return -1;
     int lo = 0, hi = npk;
     while (lo < hi) { int m = (lo + hi) / 2; if (pkeys[m] < r->key) lo = m + 1; else hi = m; }
-    int best = -1, ncand = 0;
+    int end = lo, ehi = npk;  // (the key's last candidate + 1)
+    while (end < ehi) { int m = (end + ehi) / 2; if (pkeys[m] <= r->key) end = m + 1; else ehi = m; }
+    int ncand = end - lo, at = lo + (int)r->ord;
+    if (!ncand) return -1;
+    if (at >= end) at = end - 1;
+    int best = -1;
     float bd = 2;
-    for (int i = lo; i < npk && pkeys[i] == r->key; i++) {
-        ncand++;
-        if (ptaken[i]) continue;
+    for (int k = 0; k <= 2 * MATCH_WINDOW && bd > 0; k++) {  // (at, at + 1, at - 1, at + 2, ...)
+        int i = at + (k & 1 ? (k + 1) / 2 : -(k / 2));
+        if (i < lo || i >= end || ptaken[i]) continue;
         float d = fingerprint_distance(r, &slots[prev].rec[pidx[i]]);
         if (d < bd) bd = d, best = i;
     }
@@ -429,7 +437,6 @@ bool mvec_push(int rec, uint32_t pc[MVEC_PUSH / 4]) {
     if (r->prev < 0) return false;
     const MvecRec *p = &slots[prev].rec[r->prev];
     memset(pc, 0, MVEC_PUSH);
-    bool same = true;
     for (int k = 0; k < r->ncb; k++) {
         int j = -1;
         for (int m = 0; m < p->ncb; m++) if (p->cb_slot[m] == r->cb_slot[k]) j = m;
@@ -437,10 +444,7 @@ bool mvec_push(int rec, uint32_t pc[MVEC_PUSH / 4]) {
         int s = r->cb_slot[k] - 3;
         pc[s] = p->cb_off[j] / 16;
         pc[14 + s] = (p->cb_size[j] + 15) / 16;
-        same = same && p->cb_size[j] == r->cb_size[k] &&
-               !memcmp(slots[prev].ptr + p->cb_off[j], slots[cur].ptr + r->cb_off[k], r->cb_size[k]);
     }
-    if (same) stat.unchanged++;
     slots[prev].seq = vk_pending_seq();  // (read by this frame's draws too: kept until they are done)
     return true;
 }
