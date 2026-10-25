@@ -365,11 +365,14 @@ float mvec_view_enabled(void) {
     return px;
 }
 
-bool mvec_reprojection(float m[16]) {
+bool mvec_reprojection(float m[16], float jitter[2]) {
     if (cur < 0 || prev < 0 || !slots[prev].cam.valid) return false;
     MvecCamera now;
     if (!camera_compute(&slots[cur], &now)) return false;
     mat4_mul(slots[prev].cam.vp, now.inv_vp, m);
+    // a projection offset (proj[0][2], proj[1][2]) moves the picture by minus itself in NDC
+    jitter[0] = -(now.proj[2] - slots[prev].cam.proj[2]);
+    jitter[1] = -(now.proj[6] - slots[prev].cam.proj[6]);
     return true;
 }
 

@@ -207,7 +207,11 @@ float rt_gui_speed(float game) {
 static void clock_probe(uint64_t vfr);
 static void log_screens(void);
 
+static uint64_t game_frames;  // rt_vfr_update calls: the game's frames (framepace_game_frame)
+uint64_t framepace_game_frame(void) { return __atomic_load_n(&game_frames, __ATOMIC_RELAXED); }
+
 void rt_vfr_update(uint64_t vfr) {
+    __atomic_fetch_add(&game_frames, 1, __ATOMIC_RELAXED);
     extern bool nvn_timeline(void);
     if (nvn_timeline()) LOG("[tl] %.3f %x vfr\n", plat_now_ns() / 1e6, kernel_current_thread_handle());
     extern uint64_t g_fs_vfr;  // (SAVAGEWIND_FRAME_LOG=2, nvn/objects.c)

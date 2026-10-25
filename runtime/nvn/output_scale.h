@@ -20,6 +20,10 @@ void output_scale_screen(double sw, double sh, int iw, int ih, OutScale *o);
 bool upscaler_available(int u);
 // The world camera's projection as last made (rt_persp, game thread): tan(fovy / 2), aspect, near, far; zeros before
 void rt_world_projection(float out[4]);
+// The scene's render size in pixels (vulkan/exec.c: its motion target), for the jitter's sub-pixel offsets
+void rt_jitter_set_size(uint32_t w, uint32_t h);
+// SAVAGEWIND_JITTER=1: the world camera's projection moved by a sub-pixel jitter each game frame (rt_persp_offset)
+bool rt_jitter_on(void);
 bool upscale_modes_available(void);  // (rendering below the window's size: needs render-target scaling)
 double upscale_mode_factor(int q);
 double upscale_factor(void);

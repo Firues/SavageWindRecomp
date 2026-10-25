@@ -58,8 +58,9 @@ typedef struct { float view[12], proj[16], vp[16], inv_vp[16]; bool valid; } Mve
 const MvecCamera *mvec_camera(bool previous);
 // The camera reprojection of the frame being drawn, once its scene is (at the composite): m = the previous frame's
 // view-projection * the inverse of this frame's (row-major), which takes this frame's clip position of a point that
-// did not move to the previous frame's. false: no camera for either frame.
-bool mvec_reprojection(float m[16]);
+// did not move to the previous frame's; jitter = this frame's jitter minus the previous frame's, in the game's NDC
+// (from their projections' offsets: rt_persp_offset), what the vectors are cleaned of. false: no camera for either.
+bool mvec_reprojection(float m[16], float jitter[2]);
 // SAVAGEWIND_MVEC_CAMONLY=1: (testing) camera vectors everywhere, the object vectors ignored; 2: where there is an
 // object vector, the camera vector minus it (zero on still geometry when both are right)
 int mvec_camera_only(void);

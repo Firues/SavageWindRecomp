@@ -15,6 +15,7 @@
 #include "shaders.h"
 #include "vk.h"
 #include "mvec.h"
+#include "../output_scale.h"
 #include "../renderer.h"
 #include "../../settings.h"
 #include "../output_scale.h"
@@ -885,6 +886,7 @@ static TexBackend *mvec_pass_target(NvnTexture *depth, uint32_t minw, uint32_t m
     if ((uint64_t)minw * minh > (uint64_t)mw * mh) mw = minw, mh = minh;
     if (minw != mw || minh != mh) return NULL;
     mvec_target_img = post_image(8, mw, mh, VK_FORMAT_R16G16B16A16_SFLOAT);
+    rt_jitter_set_size(mw, mh);
     return mvec_target_img;
 }
 // (debugging) SAVAGEWIND_TRACE_TEX (textures.c): texture write histories
@@ -6351,19 +6353,21 @@ static bool mvec_scene_view(Prog *pr, CmdRec *r) {
         uint64_t frame = renderer_present_count();
         float m[16];
         TexBackend *db = mvec_depth ? vk_tex(mvec_depth, false) : NULL;
+        float jit[2];
         if (mvec_filled != frame && db && db->image && db->width == mvec_target_img->width &&
-            db->height == mvec_target_img->height && mvec_reprojection(m)) {
+            db->height == mvec_target_img->height && mvec_reprojection(m, jit)) {
             mvec_filled = frame;
             vk_end_pass();
             VkCommandBuffer cb = vk_cmd();
             static const VkComponentMapping id = {0};
             VkImageView dv = vk_image_view(db, VK_IMAGE_VIEW_TYPE_2D, db->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
             mvec_vectors_img = post_image(10, mvec_target_img->width, mvec_target_img->height, mvec_target_img->format);
-            float pc[20];
+            float pc[24] = {0};
             memcpy(pc, m, sizeof m);
             pc[16] = nvn_window_origin() == 0 ? -1.0f : 1.0f;
             pc[17] = nvn_depth_mode() == 0 ? 1.0f : 0.0f;
             pc[18] = (float)mvec_camera_only();
+            pc[20] = jit[0], pc[21] = jit[1];
             VkImageView in[3] = {post_view(mvec_target_img), dv};
             post_pass_pc(cb, "mvec_fill.frag", in, 2, mvec_vectors_img, pc, sizeof pc, false);
             vk_full_barrier(cb);
