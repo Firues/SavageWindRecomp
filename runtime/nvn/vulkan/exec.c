@@ -6660,11 +6660,15 @@ static TexBackend *mvec_taa(VkCommandBuffer cb, TexBackend *b, uint64_t frame) {
 static TexBackend *fsr3_scene(VkCommandBuffer cb, TexBackend *b, uint32_t ow, uint32_t oh) {
     uint64_t frame = renderer_present_count();
     TexBackend *v = mvec_vectors_img, *db = mvec_depth ? vk_tex(mvec_depth, false) : NULL;
-    if (mvec_filled != frame || !v || v->width != b->width || v->height != b->height || !db || !db->image ||
-        db->width != b->width || db->height != b->height || ow < b->width || oh < b->height)
-        return NULL;
     float jit[2], nr, fr, fov;
-    if (!mvec_camera_now(jit, &nr, &fr, &fov)) return NULL;
+    const char *why = mvec_filled != frame ? "no vectors this frame" : !v || v->width != b->width || v->height != b->height ? "vectors' size"
+                    : !db || !db->image || db->width != b->width || db->height != b->height ? "depth's size"
+                    : ow < b->width || oh < b->height ? "output smaller" : !mvec_camera_now(jit, &nr, &fr, &fov) ? "no camera" : NULL;
+    static const char *lwhy;
+    if (why != lwhy && why) LOG("[fsr3] skipped: %s (scene %ux%u, vectors %ux%u, depth %ux%u)\n", why, b->width, b->height,
+                                v ? v->width : 0, v ? v->height : 0, db ? db->width : 0, db ? db->height : 0);
+    lwhy = why;
+    if (why) return NULL;
     uint32_t w = b->width, h = b->height;
     static const VkComponentMapping id = {0};
     TexBackend *dep = post_image(14, w, h, VK_FORMAT_R32_SFLOAT), *rea = post_image(15, w, h, VK_FORMAT_R8_UNORM);
