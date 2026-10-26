@@ -504,6 +504,16 @@ bool mvec_reprojection(float m[16], float jitter[2]) {
     return true;
 }
 
+bool mvec_camera_now(float jitter[2], float *near_, float *far_, float *fov_y) {
+    MvecCamera now;
+    if (cur < 0 || !camera_compute(&slots[cur], &now)) return false;
+    jitter[0] = -now.proj[2], jitter[1] = -now.proj[6];
+    // (OpenGL-style rows: [2][2] = -(f + n) / (f - n), [2][3] = -2fn / (f - n), [1][1] = 1 / tan(fovy / 2))
+    float a = now.proj[10], b = now.proj[11];
+    *near_ = b / (a - 1), *far_ = b / (a + 1), *fov_y = 2 * atanf(1 / now.proj[5]);
+    return true;
+}
+
 const MvecCamera *mvec_camera(bool previous) {
     int i = previous ? prev : -1;  // (the frame being recorded has no camera yet: the previous one and the one before)
     if (!previous && prev >= 0) i = (prev + MVEC_SLOTS - 1) % MVEC_SLOTS;

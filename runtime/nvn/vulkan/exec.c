@@ -876,13 +876,21 @@ static uint64_t mvec_cleared = ~0ull;
 static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f);
 static VkImageView post_view(TexBackend *d);
 // The motion target for a pass writing `depth` (minw x minh: the pass's size): the internal-resolution scene depth's
-// size (the largest RS_SCENE depth seen; its halves and levels get none), NULL for other passes
+// size (the largest RS_SCENE depth of the last frame, or of this one when larger: the scene shrinks when the upscaler
+// is turned on; its halves and levels get none), NULL for other passes
 static TexBackend *mvec_target_img;
 static NvnTexture *mvec_depth;  // the scene depth the motion target was last drawn with (mvec_fill)
 static TexBackend *mvec_pass_target(NvnTexture *depth, uint32_t minw, uint32_t minh) {
     if (vk_texture_scale_group(depth) != RS_SCENE || (st.rt.has_dview && (st.rt.dview.setmask & 1) && st.rt.dview.base_level))
         return NULL;
-    static uint32_t mw, mh;
+    static uint32_t mw, mh, fw, fh;  // (fw x fh: the largest this frame)
+    static uint64_t at = ~0ull;
+    uint64_t frame = renderer_present_count();
+    if (frame != at) {
+        if (at != ~0ull && fw) mw = fw, mh = fh;
+        at = frame, fw = fh = 0;
+    }
+    if ((uint64_t)minw * minh > (uint64_t)fw * fh) fw = minw, fh = minh;
     if ((uint64_t)minw * minh > (uint64_t)mw * mh) mw = minw, mh = minh;
     if (minw != mw || minh != mh) return NULL;
     mvec_target_img = post_image(8, mw, mh, VK_FORMAT_R16G16B16A16_SFLOAT);
@@ -6438,7 +6446,11 @@ static TexBackend *mvec_taa(VkCommandBuffer cb, TexBackend *b, uint64_t frame) {
     static const VkComponentMapping id = {0};
     VkImageView in[3] = {vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT),
                          post_view(hist), post_view(mvec_vectors_img)};
-    float pc[8] = {valid ? 1.0f : 0.0f, 0.1f, 0, 0, (float)b->width, (float)b->height};  // (0.1: the new frame's share)
+    float jit[2] = {0, 0}, nr, fr, fov;
+    mvec_camera_now(jit, &nr, &fr, &fov);
+    float flip = nvn_window_origin() == 0 ? -1.0f : 1.0f;
+    float pc[8] = {valid ? 1.0f : 0.0f, 0.1f, 0, 0, (float)b->width, (float)b->height,  // (0.1: the new frame's share)
+                   jit[0] * (float)b->width * 0.5f, -jit[1] * flip * (float)b->height * 0.5f};  // (the jitter as fsr3_scene's)
     post_pass_pc(cb, "taa.frag", in, 3, out, pc, sizeof pc, false);
     vk_full_barrier(cb);
     last = frame;

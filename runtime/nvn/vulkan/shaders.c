@@ -853,9 +853,12 @@ static const char *builtin_src(const char *name, int *stage) {
     // the previous frame, clip y = minus the image's y; .z the reactive mask, .a 0 where there is none). The history is
     // taken from where the pixel was (Catmull-Rom), kept inside this frame's 3x3 neighbourhood (a variance box in
     // YCoCg, clipped toward its centre) so what was uncovered or changed doesn't ghost, and blended with the new
-    // frame at a.y, up to 0.3 at 16 pixels of motion a frame (less resampled history: less blur in a pan; luma-weighted
-    // against flicker); effects in the reactive mask take more of the new frame. a.x 0: no
-    // history (the first frame, or a skipped one). b.xy: the size.
+    // frame at a.y, 0.0625 under a pixel of motion (still views: foliage's sub-pixel detail flickered at 0.1) and up to
+    // 0.3 at 16 pixels of motion a frame (less resampled history: less blur in a pan; luma-weighted against flicker);
+    // effects in the reactive mask take more of the new frame. The new frame is the 3x3 around the pixel weighted by
+    // each sample's distance from the pixel's centre, its jitter (b.zw, render pixels, y down) taken out: the raw
+    // texel moved with the jitter, and blending it in made thin detail shimmer. a.x 0: no history (the first frame, or
+    // a skipped one). b.xy: the size.
     if (!strcmp(name, "taa.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
@@ -880,16 +883,22 @@ static const char *builtin_src(const char *name, int *stage) {
                "void main() {\n"
                "  ivec2 p = ivec2(gl_FragCoord.xy), sz = ivec2(pc.b.xy);\n"
                "  vec4 c4 = texelFetch(t0, p, 0);\n"
-               "  vec3 c = yc(c4.rgb), m1 = vec3(0.0), m2 = vec3(0.0), mn = c, mx = c;\n"
+               "  vec3 c = yc(c4.rgb), m1 = vec3(0.0), m2 = vec3(0.0), mn = c, mx = c, cf = vec3(0.0);\n"
+               "  float cw = 0.0;\n"
                "  for (int y = -1; y <= 1; y++)\n"
                "    for (int x = -1; x <= 1; x++) {\n"
                "      vec3 s = yc(texelFetch(t0, clamp(p + ivec2(x, y), ivec2(0), sz - 1), 0).rgb);\n"
                "      m1 += s; m2 += s * s; mn = min(mn, s); mx = max(mx, s);\n"
+               "      vec2 d = vec2(x, y) - pc.b.zw;\n"  // (where the sample is from this pixel's centre: jitter taken out)
+               "      float w = exp(-2.29 * dot(d, d));\n"  // (Blackman-Harris, roughly)
+               "      cf += s * w; cw += w;\n"
                "    }\n"
+               "  c = cf / cw;\n"
                "  vec4 v = texelFetch(t2, p, 0);\n"
                "  vec2 uv = gl_FragCoord.xy / pc.b.xy, pv = uv - vec2(v.x, -v.y) * 0.5;\n"
                "  if (pc.a.x == 0.0 || v.a < 0.25 || any(lessThan(pv, vec2(0.0))) || any(greaterThan(pv, vec2(1.0)))) { o = c4; return; }\n"
                "  vec3 mu = m1 / 9.0, sg = sqrt(max(m2 / 9.0 - mu * mu, vec3(0.0)));\n"
+               "  float still = 1.0 - clamp(length(v.xy * pc.b.xy) / 4.0, 0.0, 1.0);\n"  // (1: under a pixel of motion)
                "  vec3 lo = max(mn, mu - 1.25 * sg), hi = min(mx, mu + 1.25 * sg);\n"
                "  vec3 h = yc(hist(pv, pc.b.xy));\n"
 
@@ -897,7 +906,8 @@ static const char *builtin_src(const char *name, int *stage) {
                "  vec3 u = abs(d / ext);\n"
                "  float k = max(u.x, max(u.y, u.z));\n"
                "  if (k > 1.0) h = ctr + d / k;\n"
-               "  float a = max(mix(pc.a.y, 0.3, clamp(length(v.xy * pc.b.xy) / 32.0, 0.0, 1.0)), clamp(v.z, 0.0, 1.0));\n"
+               "  float a0 = mix(pc.a.y, 0.0625, still);\n"
+               "  float a = max(mix(a0, 0.3, clamp(length(v.xy * pc.b.xy) / 32.0, 0.0, 1.0)), clamp(v.z, 0.0, 1.0));\n"
                "  float wc = a / (1.0 + c.x), wh = (1.0 - a) / (1.0 + h.x);\n"
                "  o = vec4(rgb((c * wc + h * wh) / (wc + wh)), c4.a);\n"
                "}\n";

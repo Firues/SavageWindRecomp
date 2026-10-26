@@ -65,6 +65,9 @@ const MvecCamera *mvec_camera(bool previous);
 // did not move to the previous frame's; jitter = this frame's jitter minus the previous frame's, in the game's NDC
 // (from their projections' offsets: rt_persp_offset), what the vectors are cleaned of. false: no camera for either.
 bool mvec_reprojection(float m[16], float jitter[2]);
+// This frame's camera, for TAA (exec.c mvec_taa) and a temporal upscaler: its jitter (the projection's offset in the
+// game's NDC, as mvec_reprojection's), near and far planes and vertical field of view (radians); false: none found yet
+bool mvec_camera_now(float jitter[2], float *near_, float *far_, float *fov_y);
 // SAVAGEWIND_MVEC_CAMONLY=1: (testing) camera vectors everywhere, the object vectors ignored; 2: where there is an
 // object vector, the camera vector minus it (zero on still geometry when both are right)
 int mvec_camera_only(void);
