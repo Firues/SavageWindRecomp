@@ -14,6 +14,7 @@
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
+#include "fsr3.h"
 #include "mvec.h"
 #include "../output_scale.h"
 #include "../renderer.h"
@@ -5835,10 +5836,10 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
 // output, 3, 4: FSR EASU / RCAS of the presented image; 5, 6: FSR EASU / RCAS of the 3D scene, 7: its CAS
 // sharpening (scene_post).
 enum { POST_IMAGES = 32 };  // (mvec: 8 the object vectors, 9 the debug view, 10 the motion vectors, 11 / 12 TAA's
-                            //  history, 16-31 TAA's other images: mvec_taa)
+                            //  history; FSR 3: 13 its output, 14 the depth, 15 the reactive mask; 16-31 TAA: mvec_taa)
 static TexBackend *post_image_ex(int i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags extra);
 static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f) { return post_image_ex(i, w, h, f, 0); }
-// (extra: usages besides sampling, rendering and copying from, e.g. storage for TAA's compute passes)
+// (extra: usages besides sampling, rendering and copying from, e.g. storage for TAA's passes and FSR 3's output)
 static TexBackend *post_image_ex(int i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags extra) {
     static TexBackend img[POST_IMAGES];
     static VkImageUsageFlags usage[POST_IMAGES];
@@ -5994,7 +5995,7 @@ static void cpost_pass(VkCommandBuffer cb, const char *cs, const VkImageView *sr
 // size in the window (its crop is drawn into the viewport).
 static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d) {
     VkImageView v = raw_view(b);
-    bool smaa = rt_antialias() == AA_SMAA;
+    bool smaa = rt_antialias() == AA_SMAA && !rt_fsr3();  // (FSR 3 anti-aliases the scene itself)
     uint32_t ow = (uint32_t)lround(ow_d), oh = (uint32_t)lround(oh_d);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
@@ -6066,6 +6067,7 @@ static NvnTexture *scene_composite(Prog *pr, CmdRec *r) {
 }
 
 static bool mvec_scene_view(Prog *pr, CmdRec *r, NvnTexture **taa_t, TexBackend **taa);
+static TexBackend *fsr3_scene(VkCommandBuffer cb, TexBackend *b, uint32_t ow, uint32_t oh);
 static void scene_post(Prog *pr, CmdRec *r) {
     scene_up.t = NULL;
     NvnTexture *taa_t = NULL;
@@ -6075,7 +6077,9 @@ static void scene_post(Prog *pr, CmdRec *r) {
     if (fsr_on < 0) fsr_on = getenv("SAVAGEWIND_SCENE_FSR") ? atoi(getenv("SAVAGEWIND_SCENE_FSR")) : 1;
     if (cas_on < 0) cas_on = getenv("SAVAGEWIND_SCENE_CAS") ? atoi(getenv("SAVAGEWIND_SCENE_CAS")) : 1;
     bool fsr = fsr_on && g_settings.upscaler == UPSCALE_FSR1, cas = cas_on && g_settings.sharpening > 0;
-    if (!fsr && !cas && !taa) return;
+    bool fsr3 = fsr_on && rt_fsr3() && mvec_enabled();  // (FSR 3: its own sharpening, RCAS, in place of CAS)
+    if (!fsr3) rt_jitter_set_phases(8);
+    if (!fsr && !cas && !taa && !fsr3) return;
     NvnTexture *t = scene_composite(pr, r), *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
     if (!t) return;
     const float *vp = st.viewport[0];
@@ -6086,13 +6090,14 @@ static void scene_post(Prog *pr, CmdRec *r) {
     if (oh > 16384) oh = 16384;
     {
         TexBackend *b = vk_tex(t, false);
-        bool up = fsr && (ow > b->width + 1 || oh > b->height + 1);  // (else at its size in the window already)
+        // (else at its size in the window already; FSR 3: FSR 1 for a frame it can't do, its first)
+        bool up = (fsr || fsr3) && (ow > b->width + 1 || oh > b->height + 1);
         if (t != taa_t) taa = NULL;
         scene_mip_bias = taa && ow && b->width ? log2f((float)b->width / (float)ow) - 1.0f : 0.0f;
         static const char *bias_env = (const char *)1;  // (testing) SAVAGEWIND_MIP_BIAS=<levels>: in place of that
         if (bias_env == (const char *)1) bias_env = getenv("SAVAGEWIND_MIP_BIAS");
         if (bias_env && taa) scene_mip_bias = (float)atof(bias_env);
-        if (!up && !cas && !taa) return;
+        if (!up && !cas && !taa && !fsr3) return;
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
         if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) return;
@@ -6102,6 +6107,15 @@ static void scene_post(Prog *pr, CmdRec *r) {
         VkImageView src = taa ? post_view(taa) : vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
         uint32_t w = b->width, h = b->height;
         TexBackend *out = taa;
+        TexBackend *f3 = fsr3 ? fsr3_scene(cb, b, ow, oh) : NULL;
+        if (f3) {
+            src = post_view(f3);
+            out = f3;
+            w = ow; h = oh;
+            up = cas = false;
+        } else if (!up && !cas && !taa) {
+            return;
+        }
         if (up) {
             TexBackend *e = post_image(5, ow, oh, b->format), *o = post_image(6, ow, oh, b->format);
             float iw = (float)b->width, ih = (float)b->height;
@@ -6131,11 +6145,12 @@ static void scene_post(Prog *pr, CmdRec *r) {
         scene_up.sy = (float)h / (float)t->height;
         static uint32_t lw, lh, low, loh;
         static int lcas = -1;
-        static bool ltaa;
-        if (b->width != lw || b->height != lh || w != low || h != loh || g_settings.sharpening != lcas || !!taa != ltaa)
-            LOG("[post] scene %ux%u%s%s -> %ux%u%s (format %d)\n", b->width, b->height, taa ? " taa" : "", up ? " fsr1" : "",
-                w, h, cas ? taa ? " rcas" : " cas" : "", b->format);
-        lw = b->width; lh = b->height; low = w; loh = h; lcas = g_settings.sharpening; ltaa = !!taa;
+        static bool ltaa, lf3;
+        if (b->width != lw || b->height != lh || w != low || h != loh || g_settings.sharpening != lcas || !!taa != ltaa ||
+            !!f3 != lf3)
+            LOG("[post] scene %ux%u%s%s%s -> %ux%u%s (format %d)\n", b->width, b->height, taa ? " taa" : "", up ? " fsr1" : "",
+                f3 ? " fsr3" : "", w, h, cas ? taa ? " rcas" : " cas" : "", b->format);
+        lw = b->width; lh = b->height; low = w; loh = h; lcas = g_settings.sharpening; ltaa = !!taa; lf3 = !!f3;
         return;
     }
 }
@@ -6493,7 +6508,7 @@ static bool mvec_scene_view(Prog *pr, CmdRec *r, NvnTexture **taa_t, TexBackend 
             VkImageView in[3] = {post_view(mvec_target_img), dv};
             post_pass_pc(cb, "mvec_fill.frag", in, 2, mvec_vectors_img, pc, sizeof pc, false);
             vk_full_barrier(cb);
-            taa_img = rt_antialias() == AA_TAA ? mvec_taa(cb, b, frame) : NULL;
+            taa_img = rt_antialias() == AA_TAA && !rt_fsr3() ? mvec_taa(cb, b, frame) : NULL;  // (FSR 3 does its own)
             taa_tex = t;
         }
         if (mvec_filled == frame && taa_img && taa_tex == t) *taa = taa_img, *taa_t = t;  // (a second composite: the same)
@@ -6633,6 +6648,54 @@ static TexBackend *mvec_taa(VkCommandBuffer cb, TexBackend *b, uint64_t frame) {
     last = frame;
     lw = w, lh = h;
     pj[0] = J[0], pj[1] = J[1];
+    return out;
+}
+
+// AMD FSR 3.1 (Video > Upscaler FSR 3; fsr3.h): the scene b (render size, jittered: output_scale.c rt_persp_offset with
+// FSR's sequence, rt_jitter_set_phases) to ow x oh (post image 13), from this frame's motion vectors (just filled), the
+// scene depth (as R32F, post image 14) and the reactive mask (the vectors' .z as R8, post image 15). The vectors are
+// clip-space NDC differences (y up, the image's y down: mvec_fill.frag), FSR wants the UV offset to where the pixel was:
+// (-x / 2, y / 2), its motion vector scale over the render size. Its jitter is in render pixels, y down. NULL when an
+// input is missing (no camera yet, sizes that differ) or FSR failed: the scene goes on without it.
+static TexBackend *fsr3_scene(VkCommandBuffer cb, TexBackend *b, uint32_t ow, uint32_t oh) {
+    uint64_t frame = renderer_present_count();
+    TexBackend *v = mvec_vectors_img, *db = mvec_depth ? vk_tex(mvec_depth, false) : NULL;
+    if (mvec_filled != frame || !v || v->width != b->width || v->height != b->height || !db || !db->image ||
+        db->width != b->width || db->height != b->height || ow < b->width || oh < b->height)
+        return NULL;
+    float jit[2], nr, fr, fov;
+    if (!mvec_camera_now(jit, &nr, &fr, &fov)) return NULL;
+    uint32_t w = b->width, h = b->height;
+    static const VkComponentMapping id = {0};
+    TexBackend *dep = post_image(14, w, h, VK_FORMAT_R32_SFLOAT), *rea = post_image(15, w, h, VK_FORMAT_R8_UNORM);
+    TexBackend *out = post_image_ex(13, ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+    float pc[8] = {0};
+    VkImageView di[3] = {vk_image_view(db, VK_IMAGE_VIEW_TYPE_2D, db->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT)};
+    post_pass(cb, "fsr3_depth.frag", di, 1, dep, pc, false);
+    VkImageView ri[3] = {post_view(v)};
+    post_pass(cb, "fsr3_reactive.frag", ri, 1, rea, pc, false);
+    vk_full_barrier(cb);
+    float flip = nvn_window_origin() == 0 ? -1.0f : 1.0f;  // (the game's NDC y to clip y: mvec_fill.frag's a.x)
+    static uint64_t last = ~0ull, last_ns;
+    uint64_t ns = SDL_GetTicksNS();
+    Fsr3Dispatch d = {
+        .dev = g_vk.dev, .phys = g_vk.phys, .cb = cb,
+        .color = {b->image, b->format, w, h}, .depth = {dep->image, dep->format, w, h},
+        .motion = {v->image, v->format, w, h}, .reactive = {rea->image, rea->format, w, h},
+        .output = {out->image, out->format, ow, oh},
+        .jitter = {jit[0] * (float)w * 0.5f, -jit[1] * flip * (float)h * 0.5f},
+        .motion_scale = {-0.5f * (float)w, 0.5f * (float)h},
+        .dt_ms = last_ns && ns > last_ns ? (float)((ns - last_ns) / 1e6) : 16.7f,
+        .near_ = nr, .far_ = fr, .fov_y = fov,
+        .sharpness = g_settings.sharpening / 10.0f,
+        .reset = last == ~0ull || last + 1 != frame,
+    };
+    last_ns = ns;
+    if (!fsr3_dispatch(&d)) return NULL;
+    last = frame;
+    vk_dyn_forget();  // (FSR's own pipelines and sets were bound)
+    vk_full_barrier(cb);
+    rt_jitter_set_phases((uint32_t)fsr3_jitter_phases(w, ow));
     return out;
 }
 

@@ -29,13 +29,20 @@
 #define MAX_TEX 16384.0
 #define SCENE_LINES 900.0  // the height of the game's 3D scene targets (docked)
 
+#ifndef __APPLE__
+bool fsr3_available(void);  // (vulkan/fsr3.h: built in)
+#endif
 bool upscaler_available(int u) {
 #ifdef __APPLE__
     return u == UPSCALE_OFF || u == UPSCALE_METALFX;
 #else
-    return u == UPSCALE_OFF || u == UPSCALE_FSR1;
+    return u == UPSCALE_OFF || u == UPSCALE_FSR1 || (u == UPSCALE_FSR3 && fsr3_available());
 #endif
 }
+
+bool rt_fsr3(void) { return g_settings.upscaler == UPSCALE_FSR3 && upscaler_available(UPSCALE_FSR3); }
+
+bool rt_temporal(void) { return rt_antialias() == AA_TAA || rt_fsr3(); }
 
 double upscale_mode_factor(int q) {
     static const double f[UPQ_COUNT] = {1.3, 1.5, 1.7, 2.0};
@@ -243,9 +250,10 @@ void rt_frustum(uint64_t proj, float *f) {
     f[0] = c + (lr[0] - c) * shape, f[1] = c + (lr[1] - c) * shape;
 }
 
-// Temporal anti-aliasing / upscaling jitter (Video > Anti-aliasing TAA; SAVAGEWIND_JITTER=1 / 0 whatever the setting): the world camera's projection moved by a sub-pixel
-// offset, a Halton (2, 3) sequence over 8 presented frames (framepace_shown_frame: every matrix made in one frame gets
-// the same, and the paused game's two updates a frame one phase), [-0.5, 0.5] pixels of the scene's render size
+// Temporal anti-aliasing / upscaling jitter (Video > Anti-aliasing TAA, Upscaler FSR 3; SAVAGEWIND_JITTER=1 / 0 whatever
+// the setting): the world camera's projection moved by a sub-pixel offset, a Halton (2, 3) sequence over 8 presented
+// frames (FSR 3: its own count, rt_jitter_set_phases) (framepace_shown_frame: every matrix made in one frame gets the
+// same, and the paused game's two updates a frame one phase), [-0.5, 0.5] pixels of the scene's render size
 // (rt_jitter_set_size). It lands in the projection of the frame's
 // camera block, where vulkan/mvec.c reads it back and takes it out of the motion vectors.
 static uint32_t jitter_size[2];
@@ -257,8 +265,12 @@ void rt_jitter_set_size(uint32_t w, uint32_t h) {
 bool rt_jitter_on(void) {
     static int env = -2;
     if (env == -2) env = getenv("SAVAGEWIND_JITTER") ? atoi(getenv("SAVAGEWIND_JITTER")) != 0 : -1;
-    return env >= 0 ? env : rt_antialias() == AA_TAA;
+    return env >= 0 ? env : rt_temporal();
 }
+
+// The jitter sequence's length: 8, or FSR 3's for its upscale (fsr3_jitter_phases, set by vulkan/exec.c)
+static uint32_t jitter_phases = 8;
+void rt_jitter_set_phases(uint32_t n) { __atomic_store_n(&jitter_phases, n ? n : 8, __ATOMIC_RELAXED); }
 
 // Video > Anti-aliasing (settings.h AA_*). Test override: SAVAGEWIND_AA_AT=<frame>:<off|smaa|taa>,... from that
 // presented frame on (same-view A/B in one run).
@@ -301,7 +313,8 @@ void rt_persp_offset(uint64_t proj, uint32_t *x, uint32_t *y) {
     if (shape != 1 && fabsf(a - 16.0f / 9.0f) < 0.01f) ox /= shape;
     uint32_t w = __atomic_load_n(&jitter_size[0], __ATOMIC_RELAXED), h = __atomic_load_n(&jitter_size[1], __ATOMIC_RELAXED);
     if (nf[1] > 10001 && rt_jitter_on() && w && h) {
-        uint32_t i = (uint32_t)(framepace_shown_frame() % 8) + 1;  // (from 1: Halton's 0 is 0)
+        uint32_t n = __atomic_load_n(&jitter_phases, __ATOMIC_RELAXED);
+        uint32_t i = (uint32_t)(framepace_shown_frame() % n) + 1;  // (from 1: Halton's 0 is 0)
         ox += (halton(i, 2) - 0.5f) / (float)w;
         oy += (halton(i, 3) - 0.5f) / (float)h;  // (the projection gets twice the offset: NDC is 2 wide)
     }

@@ -188,7 +188,7 @@ static void camera_finish(Slot *s) {
 
 
 uint64_t renderer_present_count(void);
-// On with Video > Anti-aliasing TAA (settings.h AA_TAA), read once a presented frame so a frame is all on or all off;
+// On with Video > Anti-aliasing TAA or Upscaler FSR 3 (output_scale.h rt_temporal), read once a presented frame so a frame is all on or all off;
 // SAVAGEWIND_MVEC=1 / 0 turns it on or off whatever the setting.
 bool mvec_enabled(void) {
     static int env = -2;
@@ -197,7 +197,7 @@ bool mvec_enabled(void) {
     static uint64_t at = ~0ull;
     static bool on;
     uint64_t f = renderer_present_count();
-    if (f != at) at = f, on = rt_antialias() == AA_TAA;
+    if (f != at) at = f, on = rt_temporal();
     return on;
 }
 

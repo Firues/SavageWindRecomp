@@ -1238,6 +1238,19 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = pc.a.z == 2.0 ? vec4(clip - prev - v.xy, 0.0, 1.0) : vec4(clip - prev - jit, v.z, 0.5);\n"
                "}\n";
     }
+    // FSR 3's inputs (exec.c fsr3_scene), at the render size: the scene depth as R32F (t0, a depth view), and the
+    // reactive mask from the motion vectors' .z (t0) as R8
+    if (!strcmp(name, "fsr3_depth.frag") || !strcmp(name, "fsr3_reactive.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return name[5] == 'd' ? "#version 450\n"
+                                "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
+                                "layout(location = 0) out vec4 o;\n"
+                                "void main() { o = vec4(texelFetch(t0, ivec2(gl_FragCoord.xy), 0).r); }\n"
+                              : "#version 450\n"
+                                "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
+                                "layout(location = 0) out vec4 o;\n"
+                                "void main() { o = vec4(clamp(texelFetch(t0, ivec2(gl_FragCoord.xy), 0).z, 0.0, 1.0)); }\n";
+    }
     if (!strncmp(name, "taa_", 4)) {
         static const char *const names[] = {"taa_prepare.comp", "taa_shade_src.comp", "taa_shade_down.comp", "taa_shade.comp",
                                             "taa_reactivity.comp", "taa_instability.comp", "taa_resolve.comp"};
