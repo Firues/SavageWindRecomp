@@ -37,6 +37,7 @@ typedef struct {
 // history buffer, mvec_records)
 typedef struct {
     uint64_t key;
+    uint64_t key2;  // the key without the index buffer and range (mvec.c prev_match_loose)
     uint32_t ord;   // among this frame's draws with the same key, in draw order
     int32_t prev;   // the matching record of the previous frame, -1: none
     float dist;     // its fingerprint's distance from that record's (mvec.c fingerprint_distance)

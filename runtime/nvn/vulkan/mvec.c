@@ -55,6 +55,10 @@ static uint64_t *pkeys;
 static int32_t *pidx;
 static bool *ptaken;
 static int npk, cap_pk;
+// The same by key2 (prev_match_loose), and which records either matching took (by record)
+static uint64_t *pkeys2;
+static int32_t *pidx2;
+static bool *rtaken;
 
 static struct {  // since the last log line
     uint64_t dist_hist[2][6];  // chosen matches' fingerprint distances: [key with one candidate / several][bucket]
@@ -64,6 +68,7 @@ static struct {  // since the last log line
     // like jumps (most of the world stands still)
     uint64_t moved_checked, moved_order, moved_fp;
     uint64_t masked;  // blended effects drawn into the reactive mask
+    uint64_t loose;   // matched by shaders and vertex buffers (prev_match_loose)
     uint64_t frames, draws, matched, repeated, unmatched, dropped, cb_bytes, inst_bytes, copied, dedupe_hits, max_used, motion,
         cameras;    // frames with a valid camera (camera_finish)
 } stat;
@@ -206,12 +211,12 @@ static void log_stats(uint64_t frame) {
     if (every <= 0 || ++stat.frames < (uint64_t)every) return;
     double f = (double)stat.frames;
     LOG("[mvec] frame %llu: %.0f scene draws a frame, matched %.1f%% (%.0f with a repeated key, %.1f%% drawn with motion), "
-        "unmatched %.0f, "
+        "unmatched %.0f, %.0f matched without their index buffer, "
         "not recorded %.0f; inputs %.0f KB constants + %.0f KB instance data a frame, %.0f KB copied (%.0f copies "
         "shared); history slot at most %.1f MB used of %.1f; camera found in %.0f%% of the frames; %.1f effects a frame in "
         "the reactive mask\n",
         (unsigned long long)frame, stat.draws / f, stat.draws ? 100.0 * stat.matched / stat.draws : 0.0, stat.repeated / f,
-        stat.draws ? 100.0 * stat.motion / stat.draws : 0.0, stat.unmatched / f, stat.dropped / f, stat.cb_bytes / f / 1024, stat.inst_bytes / f / 1024, stat.copied / f / 1024,
+        stat.draws ? 100.0 * stat.motion / stat.draws : 0.0, stat.unmatched / f, stat.loose / f, stat.dropped / f, stat.cb_bytes / f / 1024, stat.inst_bytes / f / 1024, stat.copied / f / 1024,
         stat.dedupe_hits / f, stat.max_used / 1048576.0, cur >= 0 ? slots[cur].cap / 1048576.0 : 0.0,
         100.0 * stat.cameras / f, stat.masked / f);
     for (int g = 0; g < 2; g++)
@@ -229,6 +234,11 @@ static const Slot *sort_prev;  // (cmp_by_key's records)
 static int cmp_by_key(const void *a, const void *b) {
     const MvecRec *x = &sort_prev->rec[*(const int32_t *)a], *y = &sort_prev->rec[*(const int32_t *)b];
     if (x->key != y->key) return x->key < y->key ? -1 : 1;
+    return *(const int32_t *)a < *(const int32_t *)b ? -1 : *(const int32_t *)a > *(const int32_t *)b;
+}
+static int cmp_by_key2(const void *a, const void *b) {
+    const MvecRec *x = &sort_prev->rec[*(const int32_t *)a], *y = &sort_prev->rec[*(const int32_t *)b];
+    if (x->key2 != y->key2) return x->key2 < y->key2 ? -1 : 1;
     return *(const int32_t *)a < *(const int32_t *)b ? -1 : *(const int32_t *)a > *(const int32_t *)b;
 }
 
@@ -267,12 +277,19 @@ static void frame_begin(uint64_t frame) {
         pkeys = realloc(pkeys, (size_t)cap_pk * sizeof *pkeys);
         pidx = realloc(pidx, (size_t)cap_pk * sizeof *pidx);
         ptaken = realloc(ptaken, (size_t)cap_pk * sizeof *ptaken);
+        pkeys2 = realloc(pkeys2, (size_t)cap_pk * sizeof *pkeys2);
+        pidx2 = realloc(pidx2, (size_t)cap_pk * sizeof *pidx2);
+        rtaken = realloc(rtaken, (size_t)cap_pk * sizeof *rtaken);
     }
     for (int i = 0; i < npk; i++) pidx[i] = i;
     sort_prev = &slots[prev];
     qsort(pidx, (size_t)npk, sizeof *pidx, cmp_by_key);
     for (int i = 0; i < npk; i++) pkeys[i] = slots[prev].rec[pidx[i]].key;
     memset(ptaken, 0, (size_t)npk * sizeof *ptaken);
+    for (int i = 0; i < npk; i++) pidx2[i] = i;
+    qsort(pidx2, (size_t)npk, sizeof *pidx2, cmp_by_key2);
+    for (int i = 0; i < npk; i++) pkeys2[i] = slots[prev].rec[pidx2[i]].key2;
+    memset(rtaken, 0, (size_t)npk * sizeof *rtaken);
 }
 
 // How far apart two fingerprints are: the mean relative difference of their values (0 equal, 1 unrelated); values
@@ -309,7 +326,7 @@ static int32_t prev_match(MvecRec *r) {
     float bd = 2;
     for (int k = 0; k <= 2 * MATCH_WINDOW && bd > 0; k++) {  // (at, at + 1, at - 1, at + 2, ...)
         int i = at + (k & 1 ? (k + 1) / 2 : -(k / 2));
-        if (i < lo || i >= end || ptaken[i]) continue;
+        if (i < lo || i >= end || ptaken[i] || rtaken[pidx[i]]) continue;
         float d = fingerprint_distance(r, &slots[prev].rec[pidx[i]]);
         if (d < bd) bd = d, best = i;
     }
@@ -318,12 +335,36 @@ static int32_t prev_match(MvecRec *r) {
     if (limit < 0) limit = getenv("SAVAGEWIND_MVEC_MATCH_LIMIT") ? (float)atof(getenv("SAVAGEWIND_MVEC_MATCH_LIMIT")) : 0.2f;
     if (bd >= limit) { stat.dist_hist[ncand > 1][5]++; return -1; }  // (a new object: the camera's vector)
     ptaken[best] = true;
+    rtaken[pidx[best]] = true;
     r->dist = bd;
     static const float edges[5] = {1e-4f, 1e-3f, 0.01f, 0.05f, 0.2f};
     int bucket = 0;
     while (bucket < 5 && bd >= edges[bucket]) bucket++;
     stat.dist_hist[ncand > 1][bucket]++;
     return pidx[best];
+}
+
+// A draw whose key the previous frame did not have: one of the previous frame's draws with its shaders and vertex
+// buffers and an equal fingerprint (under 0.01). BOTW draws its distant trees from one vertex pool through index
+// lists it writes anew each frame, at other addresses and lengths: matched by key, they never were, and took the
+// camera's motion alone, not their swaying (temporal anti-aliasing smeared them, a shimmer on every distant tree).
+// Their vertices hold where they are; the motion is in the constants, which any of them gives the same.
+static int32_t prev_match_loose(MvecRec *r) {
+    if (prev < 0 || !npk) return -1;
+    int lo = 0, hi = npk;
+    while (lo < hi) { int m = (lo + hi) / 2; if (pkeys2[m] < r->key2) lo = m + 1; else hi = m; }
+    int best = -1;
+    float bd = 0.01f;
+    for (int i = lo, n = 0; i < npk && pkeys2[i] == r->key2 && n < 64 && bd > 0; i++, n++) {
+        if (rtaken[pidx2[i]]) continue;
+        float d = fingerprint_distance(r, &slots[prev].rec[pidx2[i]]);
+        if (d < bd) bd = d, best = i;
+    }
+    if (best < 0) return -1;
+    rtaken[pidx2[best]] = true;
+    r->dist = bd;
+    stat.loose++;
+    return pidx2[best];
 }
 
 static int32_t prev_lookup(uint64_t key, uint32_t ord) {
@@ -381,11 +422,12 @@ int mvec_record(const MvecDrawIn *d) {
     memset(r, 0, sizeof *r);
     uint64_t key = mix(mix(mix(d->vs, d->fs), d->iaddr), ((uint64_t)d->count << 32) | d->first);
     key = mix(key, (uint32_t)d->base_vertex);
+    uint64_t key2 = mix(mix(d->vs, d->fs), ~0ull);
     uint64_t used_before = s->used;
     for (int i = 0; i < d->nstream && i < 16; i++) {
         const MvecStream *m = &d->stream[i];
         if (!((d->vs_streams >> i) & 1) || !m->addr) continue;
-        if (!m->divisor) { key = mix(key, m->addr); continue; }
+        if (!m->divisor) { key = mix(key, m->addr), key2 = mix(key2, m->addr); continue; }
         if (r->ninst == MVEC_INST) continue;
         uint64_t n = (d->base_inst + d->inst + m->divisor - 1) / m->divisor, size = n * m->stride;
         if (size > m->size && m->size) size = m->size;
@@ -421,10 +463,12 @@ int mvec_record(const MvecDrawIn *d) {
         r->nfeat += 12;
     }
     r->key = key;
+    r->key2 = key2;
     r->ord = next_ordinal(key);
     static int by_order = -1;  // SAVAGEWIND_MVEC_MATCH=order: (testing) match by draw order alone
     if (by_order < 0) by_order = getenv("SAVAGEWIND_MVEC_MATCH") && !strcmp(getenv("SAVAGEWIND_MVEC_MATCH"), "order");
     r->prev = by_order ? prev_lookup(key, r->ord) : prev_match(r);
+    if (r->prev < 0 && !by_order) r->prev = prev_match_loose(r);
     if (log_every() > 0) {  // (statistics) the object's world position (slot 4's translation) against each matching's previous draw
         int32_t po = prev_lookup(key, r->ord), pf = by_order ? -1 : r->prev;
         if (r->nfeat >= 12 && r->cb_slot[0] == 3 && r->cb_slot[1] == 4 && po >= 0 && pf >= 0) {

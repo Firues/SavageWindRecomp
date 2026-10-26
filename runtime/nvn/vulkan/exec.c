@@ -4812,7 +4812,12 @@ static void draw_(CmdRec *r, bool indexed) {
     // ---- reactive mask (mvec.c): a blended effect in a pass with the motion target (not writing depth, not full-screen:
     // those are BOTW's fog and light composites) marks its pixels in the motion target's .z (its alpha, kept by MAX), for
     // a temporal upscaler to trust its history less there
-    if (pass_mvec >= 0 && !(st.ds[0] && st.ds[1]) && (st.color_state[0] & 1) && !fullscreen) {
+    // (debugging) SAVAGEWIND_MVEC_SHOW_UNMATCHED=1: the motion passes' depth-writing draws that got no vector of their
+    // own (no match in the previous frame: the camera's motion) marked as the reactive mask is, magenta in
+    // SAVAGEWIND_MVEC_VIEW
+    static int show_unmatched = -1;
+    if (show_unmatched < 0) show_unmatched = getenv("SAVAGEWIND_MVEC_SHOW_UNMATCHED") != NULL;
+    if (pass_mvec >= 0 && ((!(st.ds[0] && st.ds[1]) && (st.color_state[0] & 1)) || (show_unmatched && st.ds[0] && st.ds[1] && !mvec_draw)) && !fullscreen) {
         ShaderKey mvk = {0}, mfk = {0};
         mvk.glsl = mfk.glsl = 1;
         mvk.flip_y = mfk.flip_y = origin == 0;
