@@ -107,6 +107,31 @@ static bool mat4_inverse(const float *m, float *o) {
     return true;
 }
 
+// The same in double (mvec_reprojection)
+static bool mat4_inverse_d(const double *m, double *o) {
+    double a[16];
+    a[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    a[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    a[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    a[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    a[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    a[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    a[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    a[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    a[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    a[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    a[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    a[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    a[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    a[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    a[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    a[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    double det = m[0] * a[0] + m[1] * a[4] + m[2] * a[8] + m[3] * a[12];
+    if (fabs(det) < 1e-30) return false;
+    for (int i = 0; i < 16; i++) o[i] = a[i] / det;
+    return true;
+}
+
 // Whether a camera block's view and projection look like the world camera: a rigid view, and a perspective projection
 // with the world camera's field of view and aspect (rt_world_projection; 2%: the field of view can ease between the
 // frame that made the block and the last matrix) and (0, 0, -1, 0) as its last row. Its other entries are left free:
@@ -468,7 +493,9 @@ int mvec_record(const MvecDrawIn *d) {
     static int by_order = -1;  // SAVAGEWIND_MVEC_MATCH=order: (testing) match by draw order alone
     if (by_order < 0) by_order = getenv("SAVAGEWIND_MVEC_MATCH") && !strcmp(getenv("SAVAGEWIND_MVEC_MATCH"), "order");
     r->prev = by_order ? prev_lookup(key, r->ord) : prev_match(r);
-    if (r->prev < 0 && !by_order) r->prev = prev_match_loose(r);
+    static int loose = -1;  // SAVAGEWIND_MVEC_LOOSE=0: (testing) no prev_match_loose
+    if (loose < 0) loose = !getenv("SAVAGEWIND_MVEC_LOOSE") || atoi(getenv("SAVAGEWIND_MVEC_LOOSE")) != 0;
+    if (r->prev < 0 && !by_order && loose) r->prev = prev_match_loose(r);
     if (log_every() > 0) {  // (statistics) the object's world position (slot 4's translation) against each matching's previous draw
         int32_t po = prev_lookup(key, r->ord), pf = by_order ? -1 : r->prev;
         if (r->nfeat >= 12 && r->cb_slot[0] == 3 && r->cb_slot[1] == 4 && po >= 0 && pf >= 0) {
@@ -541,7 +568,30 @@ bool mvec_reprojection(float m[16], float jitter[2]) {
     if (cur < 0 || prev < 0 || !slots[prev].cam.valid) return false;
     MvecCamera now;
     if (!camera_compute(&slots[cur], &now)) return false;
-    mat4_mul(slots[prev].cam.vp, now.inv_vp, m);
+    // prev proj * (prev view * inverse of this view) * inverse of this proj, in double: the views hold the camera's
+    // world position (thousands of meters), and the product of float matrices with an inverse lost the far plane's
+    // precision: the sky's and the distance's camera vectors were wrong by ~1 pixel, in step with the jitter (a sway
+    // of the sky, clouds and distant trees under TAA and FSR 3). The rigid views' relative motion cancels the position
+    // before anything is rounded.
+    const MvecCamera *pc_ = &slots[prev].cam;
+    double vp4[16] = {0}, vc4[16] = {0}, rel[16], pp[16], pcur[16], pinv[16], t[16], md[16];
+    for (int i = 0; i < 12; i++) vp4[i] = pc_->view[i], vc4[i] = now.view[i];
+    vp4[15] = vc4[15] = 1;
+    double vci[16] = {0};  // (the inverse of a rigid view: transposed rotation, minus it times the translation)
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) vci[r * 4 + c] = vc4[c * 4 + r];
+        vci[r * 4 + 3] = -(vc4[r] * vc4[3] + vc4[4 + r] * vc4[7] + vc4[8 + r] * vc4[11]);
+    }
+    vci[15] = 1;
+    for (int i = 0; i < 16; i++) pp[i] = pc_->proj[i], pcur[i] = now.proj[i];
+    if (!mat4_inverse_d(pcur, pinv)) return false;
+#define MUL_D(a, b, o) for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) \
+        o[r * 4 + c] = a[r * 4] * b[c] + a[r * 4 + 1] * b[4 + c] + a[r * 4 + 2] * b[8 + c] + a[r * 4 + 3] * b[12 + c]
+    MUL_D(vp4, vci, rel);
+    MUL_D(pp, rel, t);
+    MUL_D(t, pinv, md);
+#undef MUL_D
+    for (int i = 0; i < 16; i++) m[i] = (float)md[i];
     // a projection offset (proj[0][2], proj[1][2]) moves the picture by minus itself in NDC
     jitter[0] = -(now.proj[2] - slots[prev].cam.proj[2]);
     jitter[1] = -(now.proj[6] - slots[prev].cam.proj[6]);
