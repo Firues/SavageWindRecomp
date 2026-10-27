@@ -226,7 +226,21 @@ float rt_arrow_gravity(uint64_t arrow, float g) {
     return g * g_frame_ratio;
 }
 
+static uint64_t game_frames;  // rt_vfr_update calls: the game's frames (framepace_game_frame)
+uint64_t framepace_game_frame(void) { return __atomic_load_n(&game_frames, __ATOMIC_RELAXED); }
+// The game's frames that were presented: one step per presented frame, where game frames step twice while paused
+// (output_scale.c's jitter sequence: each presented frame gets the next phase)
+static uint64_t shown_frames;
+uint64_t framepace_shown_frame(void) { return __atomic_load_n(&shown_frames, __ATOMIC_RELAXED); }
+
 void rt_vfr_update(uint64_t vfr) {
+    __atomic_fetch_add(&game_frames, 1, __ATOMIC_RELAXED);
+    {
+        extern uint64_t renderer_present_count(void);
+        static uint64_t presented = ~0ull;
+        uint64_t n = renderer_present_count();
+        if (n != presented) presented = n, __atomic_fetch_add(&shown_frames, 1, __ATOMIC_RELAXED);
+    }
     extern bool nvn_timeline(void);
     if (nvn_timeline()) LOG("[tl] %.3f %x vfr\n", plat_now_ns() / 1e6, kernel_current_thread_handle());
     extern uint64_t g_fs_vfr;  // (SAVAGEWIND_FRAME_LOG=2, nvn/objects.c)

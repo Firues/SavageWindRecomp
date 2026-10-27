@@ -29,17 +29,24 @@
 #define MAX_TEX 16384.0
 #define SCENE_LINES 900.0  // the height of the game's 3D scene targets (docked)
 
+#ifndef __APPLE__
+bool fsr3_available(void);  // (vulkan/fsr3.h: built in)
+#endif
 bool upscaler_available(int u) {
 #ifdef __APPLE__
     return u == UPSCALE_OFF || u == UPSCALE_METALFX;
 #else
-    return u == UPSCALE_OFF || u == UPSCALE_FSR1;
+    return u == UPSCALE_OFF || u == UPSCALE_FSR1 || (u == UPSCALE_FSR3 && fsr3_available());
 #endif
 }
 
+bool rt_fsr3(void) { return g_settings.upscaler == UPSCALE_FSR3 && upscaler_available(UPSCALE_FSR3); }
+
+bool rt_temporal(void) { return rt_antialias() == AA_TAA || rt_fsr3(); }
+
 double upscale_mode_factor(int q) {
     static const double f[UPQ_COUNT] = {1.3, 1.5, 1.7, 2.0};
-    return q >= 0 && q < UPQ_COUNT ? f[q] : 1.5;
+    return q == UPQ_COUNT ? 1.0 : q >= 0 && q < UPQ_COUNT ? f[q] : 1.5;  // (UPQ_COUNT: SAVAGEWIND_UPSCALE_AT fsr3-native)
 }
 
 // Rendering below the window's size: the 3D scene's render targets at their own scale (vulkan/textures.c). Metal has
@@ -63,6 +70,7 @@ double upscale_factor(void) {
 // The window's shape over 16:9 while the game's views are widened to fill it, else 1; the field of view's factor in
 // use (rt_persp)
 static volatile float g_view_shape = 1, g_fov = 1;
+static uint32_t g_world_proj[4];  // tan(fovy / 2), aspect, near, far of the world camera's last matrix (rt_persp), float bits
 
 void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
     double fit = fmin(dw / 1920.0, dh / 1080.0);
@@ -215,6 +223,18 @@ void rt_persp(uint64_t proj, uint32_t *tan_fovy, uint32_t *aspect) {
         wide_cam[k].wrote_t = *tan_fovy, wide_cam[k].wrote_a = *aspect;
         pthread_mutex_unlock(&wide_cam_lock);
     }
+    if (nf[1] > 10001) {  // the world camera's projection as made (vulkan/mvec.c checks the scene's matrices with it)
+        float w[4] = {t, a, nf[0], nf[1]};
+        uint32_t u[4];
+        memcpy(u, w, sizeof u);
+        for (int i = 0; i < 4; i++) __atomic_store_n(&g_world_proj[i], u[i], __ATOMIC_RELAXED);
+    }
+}
+
+void rt_world_projection(float out[4]) {
+    uint32_t u[4];
+    for (int i = 0; i < 4; i++) u[i] = __atomic_load_n(&g_world_proj[i], __ATOMIC_RELAXED);
+    memcpy(out, u, sizeof u);
 }
 
 // The game's frustum views (tools/patches.py _frustum_load: sead's FrustumProjection; left, right at +0xa8 / +0xac,
@@ -231,17 +251,75 @@ void rt_frustum(uint64_t proj, float *f) {
     f[0] = c + (lr[0] - c) * shape, f[1] = c + (lr[1] - c) * shape;
 }
 
+// Temporal anti-aliasing / upscaling jitter (Video > Anti-aliasing TAA, Upscaler FSR 3; SAVAGEWIND_JITTER=1 / 0 whatever
+// the setting): the world camera's projection moved by a sub-pixel offset, a Halton (2, 3) sequence over 8 presented
+// frames (FSR 3: its own count, rt_jitter_set_phases) (framepace_shown_frame: every matrix made in one frame gets the
+// same, and the paused game's two updates a frame one phase), [-0.5, 0.5] pixels of the scene's render size
+// (rt_jitter_set_size). It lands in the projection of the frame's
+// camera block, where vulkan/mvec.c reads it back and takes it out of the motion vectors.
+static uint32_t jitter_size[2];
+void rt_jitter_set_size(uint32_t w, uint32_t h) {
+    __atomic_store_n(&jitter_size[0], w, __ATOMIC_RELAXED);
+    __atomic_store_n(&jitter_size[1], h, __ATOMIC_RELAXED);
+}
+
+bool rt_jitter_on(void) {
+    static int env = -2;
+    if (env == -2) env = getenv("SAVAGEWIND_JITTER") ? atoi(getenv("SAVAGEWIND_JITTER")) != 0 : -1;
+    return env >= 0 ? env : rt_temporal();
+}
+
+// The jitter sequence's length: 8, or FSR 3's for its upscale (fsr3_jitter_phases, set by vulkan/exec.c)
+static uint32_t jitter_phases = 8;
+void rt_jitter_set_phases(uint32_t n) { __atomic_store_n(&jitter_phases, n ? n : 8, __ATOMIC_RELAXED); }
+
+// Video > Anti-aliasing (settings.h AA_*). Test override: SAVAGEWIND_AA_AT=<frame>:<off|smaa|taa>,... from that
+// presented frame on (same-view A/B in one run).
+uint64_t renderer_present_count(void);
+int rt_antialias(void) {
+    static int n = -1;
+    static unsigned long long at[8];
+    static int mode[8];
+    if (n < 0) {
+        n = 0;
+        for (const char *e = getenv("SAVAGEWIND_AA_AT"); e && *e && n < 8;) {
+            char name[16] = "";
+            if (sscanf(e, "%llu:%15[^,]", &at[n], name) != 2) break;
+            mode[n++] = !strcmp(name, "taa") ? AA_TAA : !strcmp(name, "smaa") ? AA_SMAA : AA_OFF;
+            e = strchr(e, ',');
+            if (e) e++;
+        }
+    }
+    int r = g_settings.antialias;
+    uint64_t frame = n ? renderer_present_count() : 0;
+    for (int i = 0; i < n; i++)
+        if (frame >= at[i]) r = mode[i];
+    return r;
+}
+
+static float halton(uint32_t i, uint32_t b) {
+    float f = 1, r = 0;
+    for (; i; i /= b) f /= (float)b, r += f * (float)(i % b);
+    return r;
+}
+
 // A perspective view's offset (x, y: fractions of its width and height, as float bits; tools/patches.py
 // _persp_matrix_offset), for a view rt_persp widens: the same distance in its 16:9 part (x / shape), so what the game
-// moves to a side lines up with the 16:9 layout around it.
+// moves to a side lines up with the 16:9 layout around it. The world camera's also gets the jitter.
 void rt_persp_offset(uint64_t proj, uint32_t *x, uint32_t *y) {
-    (void)y;
-    float a, ox, shape = g_view_shape;
+    float a, ox, oy, shape = g_view_shape, nf[2];
     memcpy(&a, (const void *)(uintptr_t)(proj + 0xb0), 4);
-    if (shape == 1 || fabsf(a - 16.0f / 9.0f) >= 0.01f) return;
-    memcpy(&ox, x, 4);
-    ox /= shape;
-    memcpy(x, &ox, 4);
+    memcpy(nf, (const void *)(uintptr_t)(proj + 0x98), 8);
+    memcpy(&ox, x, 4), memcpy(&oy, y, 4);
+    if (shape != 1 && fabsf(a - 16.0f / 9.0f) < 0.01f) ox /= shape;
+    uint32_t w = __atomic_load_n(&jitter_size[0], __ATOMIC_RELAXED), h = __atomic_load_n(&jitter_size[1], __ATOMIC_RELAXED);
+    if (nf[1] > 10001 && rt_jitter_on() && w && h) {
+        uint32_t n = __atomic_load_n(&jitter_phases, __ATOMIC_RELAXED);
+        uint32_t i = (uint32_t)(framepace_shown_frame() % n) + 1;  // (from 1: Halton's 0 is 0)
+        ox += (halton(i, 2) - 0.5f) / (float)w;
+        oy += (halton(i, 3) - 0.5f) / (float)h;  // (the projection gets twice the offset: NDC is 2 wide)
+    }
+    memcpy(x, &ox, 4), memcpy(y, &oy, 4);
 }
 
 void output_scale_screen(double sw, double sh, int iw, int ih, OutScale *o) {

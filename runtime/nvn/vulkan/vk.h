@@ -41,6 +41,7 @@ typedef struct {
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, wide_lines;
     bool feat_aniso;  // samplerAnisotropy (Video > Anisotropic filtering)
+    bool storage_ext;  // shaderStorageImageExtendedFormats (TAA's R8 / R16F / RG16F storage images: exec.c mvec_taa)
     bool depth_clamp;          // depthClamp feature (nvnCommandBufferSetDepthClamp: shadow maps keep occluders before the near plane)
     bool occlusion_precise;    // occlusionQueryPrecise: SAMPLES_PASSED counts samples, not just "any"
     bool feedback_loop;        // attachment feedback loops + barriers inside dynamic rendering (exec.c)
@@ -140,7 +141,8 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
 void vk_block_flush(VkCommandBuffer cb, TexBackend *b);  // (outside a pass) b->block's texels into b's blocks
-VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok);  // (aniso_ok: Video > Anisotropic filtering may apply)
+VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok, float bias);  // (aniso_ok: Video > Anisotropic filtering may
+                                                                     //  apply; bias: added to the LOD bias)
 VkSampler vk_default_sampler(bool linear);
 void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);
 // Destruction once every submission that may use the object has completed.
