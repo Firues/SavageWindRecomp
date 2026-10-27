@@ -51,6 +51,8 @@ typedef struct {
     float backend_aniso;  // the max anisotropy `backend` was made with (vulkan/textures.c vk_sampler)
     void *backend_plain;  // the same without Video > Anisotropic filtering's override (vk_sampler aniso_ok false)
     float backend_plain_aniso;
+    void *backend_bias[2];  // the same with TAA's mip bias added (vk_sampler bias), without / with the override
+    float backend_bias_aniso[2], backend_bias_lod[2];
 } NvnSamplerDesc;
 
 // Our layout inside the guest NVNtextureView. NVN 55's struct is 16 bytes (its driver's SetDefaults clears exactly

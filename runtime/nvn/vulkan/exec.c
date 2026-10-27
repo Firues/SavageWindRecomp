@@ -3686,6 +3686,13 @@ static bool aniso_all(void) {
     return at && renderer_present_count() >= (uint64_t)at;
 }
 
+// Texture LOD bias for the jittered scene (TAA: set by scene_post): log2(render size / output size) - 1, the temporal
+// pass resolving the detail a lower mip level would have averaged away (AMD's guidance for temporal upscalers; -1 at
+// the scene's own size). The game's own textures (uploaded, not drawn: materials, terrain, foliage) in the fragment
+// stage of the passes that get the motion target only. Not what the GPU draws or computes: the deferred lighting in
+// those passes reads mip chains the game made itself (the scene's luminance for the exposure, probes) at exact levels,
+// and a level off there lit every surface white. Nor the vertex stage's terrain and grass lookups, shadows, the HUD.
+static float scene_mip_bias;
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
@@ -3696,7 +3703,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
     // (vk_sampler's Video > Anisotropic filtering: not for textures with one mip level - the render targets BOTW reads
     // back - nor in blended draws - particles, effects, decals - whose quads' square edges it brought out)
-    bool all = aniso_all(), aniso_ok = all || !(st.color_state[0] & 1);
+    bool all = aniso_all(), aniso_ok = all || !(st.color_state[0] & 1), material = false;
     sc[0] = sc[1] = 1;
     wh[0] = wh[1] = 0;
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
@@ -3723,6 +3730,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                 memo[ms].type = (uint8_t)st_->type; memo[ms].has_view = e->has_view; memo[ms].view = view;
             }
             renderer_texture_scale(et, &sc[0], &sc[1]);
+            material = et->backend && !((TexBackend *)et->backend)->gpu_owned;
             if (et == scene_up.t && stage == 1) {  // (with the texture's own swizzle: BOTW draws its weapon wheel's
                 // blurred capture of the scene, whose alpha is 0, with alpha forced to 1)
                 view = vk_image_view(scene_up.img, VK_IMAGE_VIEW_TYPE_2D, scene_up.img->format, 0, 1, 0, 1,
@@ -3747,7 +3755,9 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             }
         }
     }
-    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc], aniso_ok);
+    float bias = material && stage == 1 && pass_mvec >= 0 && rt_jitter_on() ? scene_mip_bias : 0;
+    if (h && st.spool && tsc < (uint32_t)st.spool->count)
+        smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc], aniso_ok, bias);
     if (!view) view = vk_dummy_view(st_->type), layout = VK_IMAGE_LAYOUT_GENERAL;
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, layout};
@@ -6014,6 +6024,10 @@ static void scene_post(Prog *pr, CmdRec *r) {
         TexBackend *b = vk_tex(t, false);
         bool up = fsr && (ow > b->width + 1 || oh > b->height + 1);  // (else at its size in the window already)
         if (t != taa_t) taa = NULL;
+        scene_mip_bias = taa && ow && b->width ? log2f((float)b->width / (float)ow) - 1.0f : 0.0f;
+        static const char *bias_env = (const char *)1;  // (testing) SAVAGEWIND_MIP_BIAS=<levels>: in place of that
+        if (bias_env == (const char *)1) bias_env = getenv("SAVAGEWIND_MIP_BIAS");
+        if (bias_env && taa) scene_mip_bias = (float)atof(bias_env);
         if (!up && !cas && !taa) return;
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);

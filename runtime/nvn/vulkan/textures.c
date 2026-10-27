@@ -1321,20 +1321,24 @@ static pthread_mutex_t g_sampler_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso);
 
-VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok) {
+VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok, float bias) {
     float an = sampler_aniso(d, aniso_ok);
-    void **slot = aniso_ok ? &d->backend : &d->backend_plain;
-    float *slot_aniso = aniso_ok ? &d->backend_aniso : &d->backend_plain_aniso;
-    if (*slot && *slot_aniso == an) return (VkSampler)*slot;
+    if (d->min_filter <= 1) bias = 0;  // (no mip levels: nothing to bias)
+    int k = aniso_ok ? 1 : 0;
+    void **slot = bias != 0 ? &d->backend_bias[k] : aniso_ok ? &d->backend : &d->backend_plain;
+    float *slot_aniso = bias != 0 ? &d->backend_bias_aniso[k] : aniso_ok ? &d->backend_aniso : &d->backend_plain_aniso;
+    if (*slot && *slot_aniso == an && (bias == 0 || d->backend_bias_lod[k] == bias)) return (VkSampler)*slot;
     NvnSamplerDesc key = *d;
-    key.backend = key.backend_plain = NULL;
+    key.backend = key.backend_plain = key.backend_bias[0] = key.backend_bias[1] = NULL;
     key.backend_aniso = an, key.backend_plain_aniso = 0;
+    key.backend_bias_aniso[0] = key.backend_bias_aniso[1] = key.backend_bias_lod[0] = key.backend_bias_lod[1] = 0;
+    key.lod_bias += bias;
     pthread_mutex_lock(&g_sampler_lock);
     VkSampler s = VK_NULL_HANDLE;
     for (int i = 0; i < g_nsamplers && !s; i++)
         if (!memcmp(&g_samplers[i].key, &key, sizeof key)) s = g_samplers[i].s;
     if (!s) {
-        s = sampler_create(d, an);
+        s = sampler_create(&key, an);
         if (g_nsamplers == g_cap_samplers) {
             g_cap_samplers = g_cap_samplers ? g_cap_samplers * 2 : 256;
             g_samplers = realloc(g_samplers, g_cap_samplers * sizeof *g_samplers);
@@ -1350,6 +1354,7 @@ VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok) {
     pthread_mutex_unlock(&g_sampler_lock);
     *slot = (void *)s;
     *slot_aniso = an;
+    if (bias != 0) d->backend_bias_lod[k] = bias;
     return s;
 }
 
@@ -1376,7 +1381,13 @@ static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso) {
     si.maxLod = d->lod_max > 1000 ? VK_LOD_CLAMP_NONE : d->lod_max;
     if (mf <= 1) si.maxLod = si.minLod + 0.25f;  // not mipmapped: stay on the base level
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
-    si.mipLodBias = d->lod_bias;
+    static float max_bias;
+    if (!max_bias) {
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(g_vk.phys, &pp);
+        max_bias = pp.limits.maxSamplerLodBias;
+    }
+    si.mipLodBias = fmaxf(-max_bias, fminf(max_bias, d->lod_bias));
     if (aniso > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = aniso; }
     static float lodmin = -1;
     if (lodmin < 0) lodmin = getenv("SAVAGEWIND_LOD_MIN") ? (float)atof(getenv("SAVAGEWIND_LOD_MIN")) : 0;
