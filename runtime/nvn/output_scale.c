@@ -46,7 +46,7 @@ bool rt_temporal(void) { return rt_antialias() == AA_TAA || rt_fsr3(); }
 
 double upscale_mode_factor(int q) {
     static const double f[UPQ_COUNT] = {1.3, 1.5, 1.7, 2.0};
-    return q >= 0 && q < UPQ_COUNT ? f[q] : 1.5;
+    return q == UPQ_COUNT ? 1.0 : q >= 0 && q < UPQ_COUNT ? f[q] : 1.5;  // (UPQ_COUNT: SAVAGEWIND_UPSCALE_AT fsr3-native)
 }
 
 // Rendering below the window's size: the 3D scene's render targets at their own scale (vulkan/textures.c). Metal has
