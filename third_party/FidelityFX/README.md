@@ -31,3 +31,6 @@ Changes to the SDK's files (marked "Savage Wind" in them):
   faulted; MSVC emits unaligned ones.
 - `sdk/include/FidelityFX/host/ffx_types.h`: the contexts' default size is doubled outside Windows, where `wchar_t`
   (their resources' debug names) is 4 bytes instead of 2.
+- `sdk/src/backends/vk/ffx_vk.cpp`: the global descriptor pool is created with all six of the sizes it lists. It passed
+  five, leaving out the storage buffers, which the FSR 3 upscaler's passes allocate from it (the Vulkan validation
+  layer reports it; NVIDIA's driver allocates them anyway).
