@@ -144,21 +144,22 @@ jobs:
           done
           exit 1
 
-      # make gen-helper создаёт venv и ждёт его в build/gen-venv/Scripts/python.exe; в MSYS2-шелле venv
-      # получается с другой раскладкой, поэтому те же шаги делаются напрямую тем же PyInstaller'ом.
+      # В MSYS2-шелле `python` — это Python 3.14 из самого MSYS2, без pip, и venv он делает с раскладкой
+      # bin/, а make gen-helper ждёт build/gen-venv/Scripts/python.exe. Поэтому берём интерпретатор
+      # из setup-python по абсолютному пути и делаем те же шаги, что и цель gen-helper.
       - name: Freeze the game code generator (swgen)
         run: |
-          python -V
-          python -c "import sys; print(sys.executable)"
-          python -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
+          PY="$(cygpath -u "$pythonLocation")/python.exe"
+          "$PY" -V
+          "$PY" -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
           USERPROFILE="$(cygpath -w ~ 2>/dev/null || echo $HOME)" \
-            python -m PyInstaller --noconfirm --clean --log-level WARN \
+            "$PY" -m PyInstaller --noconfirm --clean --log-level WARN \
               --distpath build/helper --workpath build/pyinstaller tools/swgen.spec
-          python tools/pe_no_cfg.py build/helper/swgen/swgen.exe
+          "$PY" tools/pe_no_cfg.py build/helper/swgen/swgen.exe
           du -sh build/helper/swgen
 
       - name: Package (make dist)
-        run: make dist GEN_PY=python
+        run: make dist
 
       - name: Collect
         run: |
