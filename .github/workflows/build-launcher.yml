@@ -144,8 +144,18 @@ jobs:
           done
           exit 1
 
-      - name: Freeze the game code generator (make gen-helper)
-        run: make gen-helper GEN_PY=python
+      # make gen-helper создаёт venv и ждёт его в build/gen-venv/Scripts/python.exe; в MSYS2-шелле venv
+      # получается с другой раскладкой, поэтому те же шаги делаются напрямую тем же PyInstaller'ом.
+      - name: Freeze the game code generator (swgen)
+        run: |
+          python -V
+          python -c "import sys; print(sys.executable)"
+          python -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
+          USERPROFILE="$(cygpath -w ~ 2>/dev/null || echo $HOME)" \
+            python -m PyInstaller --noconfirm --clean --log-level WARN \
+              --distpath build/helper --workpath build/pyinstaller tools/swgen.spec
+          python tools/pe_no_cfg.py build/helper/swgen/swgen.exe
+          du -sh build/helper/swgen
 
       - name: Package (make dist)
         run: make dist GEN_PY=python
