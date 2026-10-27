@@ -1,12 +1,10 @@
-# Сборка лаунчера Savage Wind на раннере GitHub (только приложение, без кода игры).
-# Положить в свой форк по пути .github/workflows/build-launcher.yml
+# Полная сборка Savage Wind на раннере GitHub: `make dist` — то же, что делает мейнтейнер для релиза.
+# Кладётся в свой форк по пути .github/workflows/build-launcher.yml
 #
 # Два задания:
-#   quick   — обычный `make -j`, как у разработчика в MSYS2. Быстро (~3-6 мин), но exe консольный
-#             и линкуется с GPL-FFmpeg из MSYS2: запускать только из MSYS2-шелла с PATH.
-#   release — то же, что делает `make dist`: LGPL-FFmpeg 9.0.2 из tools/build_deps_windows.sh,
-#             RELEASE=1 (без консольного окна). Такой exe - прямая замена файлов в официальном
-#             релизном zip. Первый прогон дольше (собирает FFmpeg), дальше берётся из кеша.
+#   quick — обычный `make -j`, как у разработчика в MSYS2. Быстрая проверка, что код компилируется (~5 мин).
+#   dist  — `make dist`: LGPL FFmpeg 9.0.2, замороженный генератор (swgen), компилятор zig (slim),
+#           gamelib-src, шрифты, иконка. На выходе — готовый zip, как официальный релиз, только из своей ветки.
 #
 # Игровые файлы тут не нужны и не используются: generated/ отсутствует, поэтому make собирает
 # только оболочку. Код игры по-прежнему компилируется на вашем ПК при первом запуске.
@@ -70,10 +68,10 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  release:
-    name: Release-style (LGPL FFmpeg, no console)
+  dist:
+    name: Full release zip (make dist)
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     defaults:
       run:
         shell: msys2 {0}
@@ -98,6 +96,14 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-zlib
+            unzip
+            zip
+
+      # Python 3.12: tools/gen-helper замораживает swgen через PyInstaller, и нужны готовые wheels
+      # unicorn / capstone (у MSYS2-шного Python их нет).
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
 
       # FFmpeg 9.0.2 (LGPL) собирается один раз на версию скрипта, дальше берётся из кеша.
       # Кешируем результат, а не дерево сборки: скрипт пропускает сборку, если на месте lib/libavcodec.dll.a.
@@ -110,6 +116,15 @@ jobs:
             build/deps-win/src/ffmpeg-9.0.2.tar.xz
           key: deps-win-${{ hashFiles('tools/build_deps_windows.sh') }}
 
+      # То же для компилятора: 50 МБ архива и распакованный zig, чтобы не тянуть каждый раз.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            build/zig
+            build/zig-dl
+            build/zig-slim
+          key: zig-${{ hashFiles('tools/fetch_zig.sh', 'tools/zig_slim.sh') }}
+
       - name: Build LGPL FFmpeg (make deps-windows)
         run: |
           # ffmpeg.org изредка недоступен с раннера: три попытки, скрипт продолжает с того же места.
@@ -120,22 +135,41 @@ jobs:
           done
           exit 1
 
-      - name: Build launcher
-        run: >-
-          make -j$(nproc) B=build/win-release DEPS="$PWD/build/deps-win" RELEASE=1
-          build/win-release/savagewind.exe
-          build/win-release/savagewind-config.exe
+      - name: Fetch zig
+        run: |
+          for i in 1 2 3; do
+            if bash tools/fetch_zig.sh; then exit 0; fi
+            echo "::warning::fetch_zig attempt $i failed, retrying"
+            sleep 20
+          done
+          exit 1
+
+      # В MSYS2-шелле `python` — это Python 3.14 из самого MSYS2, без pip, и venv он делает с раскладкой
+      # bin/, а make gen-helper ждёт build/gen-venv/Scripts/python.exe. Поэтому берём интерпретатор
+      # из setup-python по абсолютному пути и делаем те же шаги, что и цель gen-helper.
+      - name: Freeze the game code generator (swgen)
+        run: |
+          PY="$(cygpath -u "$pythonLocation")/python.exe"
+          "$PY" -V
+          "$PY" -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
+          USERPROFILE="$(cygpath -w ~ 2>/dev/null || echo $HOME)" \
+            "$PY" -m PyInstaller --noconfirm --clean --log-level WARN \
+              --distpath build/helper --workpath build/pyinstaller tools/swgen.spec
+          "$PY" tools/pe_no_cfg.py build/helper/swgen/swgen.exe
+          du -sh build/helper/swgen
+
+      - name: Package (make dist)
+        run: make dist
 
       - name: Collect
         run: |
-          mkdir -p out/release
-          cp build/win-release/savagewind.exe build/win-release/savagewind.dll.a out/release/
-          cp build/win-release/savagewind-config.exe "out/release/Savage Wind Configuration.exe"
-          ls -l out/release
+          mkdir -p out/dist
+          cp build/dist/*.zip out/dist/
+          ls -lh out/dist
 
       - uses: actions/upload-artifact@v7
         with:
-          name: savagewind-release
-          path: out/release
+          name: savagewind-release-zip
+          path: out/dist
           if-no-files-found: error
           retention-days: 30
