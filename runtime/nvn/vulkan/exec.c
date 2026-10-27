@@ -432,9 +432,10 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16384},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
                                             {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLER, 4096},
-                                            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 32768}};
+                                            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 32768},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}};  // (TAA's compute passes)
             VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192,
-                                             .poolSizeCount = 6, .pPoolSizes = sizes};
+                                             .poolSizeCount = 7, .pPoolSizes = sizes};
             VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &s->pools[s->npools++]));
         }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -5833,11 +5834,16 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
 // Post image `i` at w x h in format f (kept until the size or format changes). 0, 1: SMAA edges / weights, 2: SMAA
 // output, 3, 4: FSR EASU / RCAS of the presented image; 5, 6: FSR EASU / RCAS of the 3D scene, 7: its CAS
 // sharpening (scene_post).
-enum { POST_IMAGES = 13 };  // (mvec: 8 the object vectors, 9 the debug view, 10 the motion vectors, 11 / 12 TAA)
-static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f) {
+enum { POST_IMAGES = 32 };  // (mvec: 8 the object vectors, 9 the debug view, 10 the motion vectors, 11 / 12 TAA's
+                            //  history, 16-31 TAA's other images: mvec_taa)
+static TexBackend *post_image_ex(int i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags extra);
+static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f) { return post_image_ex(i, w, h, f, 0); }
+// (extra: usages besides sampling, rendering and copying from, e.g. storage for TAA's compute passes)
+static TexBackend *post_image_ex(int i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags extra) {
     static TexBackend img[POST_IMAGES];
+    static VkImageUsageFlags usage[POST_IMAGES];
     TexBackend *d = &img[i];
-    if (d->image && (d->width != w || d->height != h || d->format != f)) {
+    if (d->image && (d->width != w || d->height != h || d->format != f || usage[i] != extra)) {
         vk_views_forget(d);
         vk_defer_image(d->image, d->mem);
         d->image = VK_NULL_HANDLE;
@@ -5847,9 +5853,10 @@ static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f) {
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
                                 .format = f, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                                 .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | extra};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        usage[i] = extra;
         d->format = f; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
         d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
         vk_image_init_layout(vk_cmd(), d->image, d->aspect);
@@ -5893,6 +5900,7 @@ static void post_pass_pc(VkCommandBuffer cb, const char *fs, const VkImageView *
                          uint32_t pc_bytes, bool clear) {
     VkPipeline pipe = post_pipeline(fs, dst->format);  // (before the rendering begins: created inside it, the NVIDIA driver crashed)
     vk_full_barrier(cb);
+    gp_mark(cb, "post %s %ux%u", fs, dst->width, dst->height);
     VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(dst),
                                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                                     .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
@@ -5925,6 +5933,61 @@ static void post_pass_pc(VkCommandBuffer cb, const char *fs, const VkImageView *
 static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float pc[8],
                       bool clear) {
     post_pass_pc(cb, fs, srcs, n, dst, pc, 32, clear);
+}
+
+// One compute post pass (TAA's, shaders.c taa_*.comp): srcs sampled at bindings 0..n-1 (linear / clamp), dsts as
+// storage images at 8..8+m-1 (post images made with VK_IMAGE_USAGE_STORAGE_BIT), 8x8 groups over w x h, 64 bytes of
+// push constants.
+static VkPipelineLayout cpost_layout;
+static VkDescriptorSetLayout cpost_set_layout;
+static void cpost_pass(VkCommandBuffer cb, const char *cs, const VkImageView *srcs, int n, TexBackend *const *dsts, int m,
+                       const float pc[16], uint32_t w, uint32_t h) {
+    static struct { const char *cs; VkPipeline p; } cache[16];
+    VkPipeline pipe = VK_NULL_HANDLE;
+    for (int i = 0; i < 16 && !pipe; i++) if (cache[i].p && cache[i].cs == cs) pipe = cache[i].p;
+    if (!pipe) {
+        if (!cpost_layout) {
+            VkDescriptorSetLayoutBinding b[16];
+            for (uint32_t i = 0; i < 16; i++)
+                b[i] = (VkDescriptorSetLayoutBinding){i, i < 8 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                      1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+            VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 16,
+                                                  .pBindings = b};
+            VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &cpost_set_layout));
+            VkPushConstantRange r = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
+            VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                             .pSetLayouts = &cpost_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
+            VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &cpost_layout));
+        }
+        VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                          .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                    .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = vk_builtin_shader(cs), .pName = "main"},
+                                          .layout = cpost_layout};
+        VK_CHECK(vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &pipe));
+        for (int i = 0; i < 16; i++) if (!cache[i].p) { cache[i].cs = cs; cache[i].p = pipe; break; }
+    }
+    vk_full_barrier(cb);
+    gp_mark(cb, "post %s %ux%u", cs, w, h);
+    VkDescriptorSet ds = vk_alloc_set(cpost_set_layout);
+    VkDescriptorImageInfo ii[16];
+    VkWriteDescriptorSet wr[16];
+    int k = 0;
+    for (int i = 0; i < n; i++, k++) {
+        ii[k] = (VkDescriptorImageInfo){vk_default_sampler(true), srcs[i], VK_IMAGE_LAYOUT_GENERAL};
+        wr[k] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = (uint32_t)i,
+                                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                       .pImageInfo = &ii[k]};
+    }
+    for (int i = 0; i < m; i++, k++) {
+        ii[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, post_view(dsts[i]), VK_IMAGE_LAYOUT_GENERAL};
+        wr[k] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 8 + (uint32_t)i,
+                                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[k]};
+    }
+    vkUpdateDescriptorSets(g_vk.dev, (uint32_t)k, wr, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cpost_layout, 0, 1, &ds, 0, NULL);
+    vkCmdPushConstants(cb, cpost_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, pc);
+    vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
 }
 
 // The view the present samples: the game image, or its anti-aliased / upscaled version. ow x oh: the whole image's
@@ -5981,9 +6044,10 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
 // Sharpening), on the 3D image only, before the game draws its HUD over it. The 3D scene's targets are at the internal
 // resolution (textures.c RS_SCENE), the final image at the window's (RS_OUT), and the game's composite draw would
 // scale the scene up bilinearly. Before that draw, EASU brings the scene to its size in the final image and RCAS
-// sharpens it; then CAS, if on, sharpens the result (or the native scene, with the upscaler off), all in the scene's
-// own format (10-bit: no banding); the draw then samples that at 1:1 (texture_info). SAVAGEWIND_SCENE_FSR=0: the
-// game's own bilinear composite (A/B); SAVAGEWIND_SCENE_CAS=0: no sharpening whatever the setting.
+// sharpens it; then CAS (RCAS after TAA), if on, sharpens the result (or the native scene, with the upscaler off), all
+// in the scene's own format (10-bit: no banding); the draw then samples that at 1:1 (texture_info).
+// SAVAGEWIND_SCENE_FSR=0: the game's own bilinear composite (A/B); SAVAGEWIND_SCENE_CAS=0: no sharpening whatever the
+// setting.
 // The draw is the scene -> final image composite: a few vertices into the final image (RS_OUT) over most of it,
 // sampling a full-size scene target (not one of its reduced steps: bloom, blur). Its scene texture, or NULL.
 static NvnTexture *scene_composite(Prog *pr, CmdRec *r) {
@@ -6051,11 +6115,13 @@ static void scene_post(Prog *pr, CmdRec *r) {
             out = o;
             w = ow; h = oh;
         }
-        if (cas) {
+        if (cas) {  // (after TAA: RCAS, as FSR 3 sharpens, its noise term keeping the residual flicker from being
+                    //  pushed up the way CAS did; its strength FSR 3's: 2 - 2 x sharpness stops)
             TexBackend *c = post_image(7, w, h, b->format);
-            float pc[8] = {g_settings.sharpening / 10.0f, 0, 0, 0, (float)w, (float)h};
+            float sh = g_settings.sharpening / 10.0f;
+            float pc[8] = {taa ? exp2f(-(2.0f - 2.0f * sh)) : sh, 0, 0, 0, (float)w, (float)h};
             VkImageView ci[3] = {src};
-            post_pass(cb, "cas.frag", ci, 1, c, pc, false);
+            post_pass(cb, taa ? "rcas.frag" : "cas.frag", ci, 1, c, pc, false);
             out = c;
         }
         vk_full_barrier(cb);
@@ -6068,7 +6134,7 @@ static void scene_post(Prog *pr, CmdRec *r) {
         static bool ltaa;
         if (b->width != lw || b->height != lh || w != low || h != loh || g_settings.sharpening != lcas || !!taa != ltaa)
             LOG("[post] scene %ux%u%s%s -> %ux%u%s (format %d)\n", b->width, b->height, taa ? " taa" : "", up ? " fsr1" : "",
-                w, h, cas ? " cas" : "", b->format);
+                w, h, cas ? taa ? " rcas" : " cas" : "", b->format);
         lw = b->width; lh = b->height; low = w; loh = h; lcas = g_settings.sharpening; ltaa = !!taa;
         return;
     }
@@ -6450,29 +6516,123 @@ static bool mvec_scene_view(Prog *pr, CmdRec *r, NvnTexture **taa_t, TexBackend 
     return false;
 }
 
-// Temporal anti-aliasing (Video > Anti-aliasing TAA; shaders.c taa.frag): the scene b (jittered: output_scale.c
-// rt_persp_offset) blended with the previous output (post images 11 and 12 in turn, RGBA16F) along this frame's motion
-// vectors (just filled). The history starts over when a frame was not blended (TAA off, a frame without the scene)
-// or the size changed. NULL when the vectors aren't the scene's size.
+// Temporal anti-aliasing (Video > Anti-aliasing TAA): the scene b (jittered: output_scale.c rt_persp_offset, Halton
+// (2, 3) over 8 frames) accumulated over frames along this frame's motion vectors (just filled), with the scene depth:
+// AMD FSR 3.1's upscaler's reconstruction at the scene's own size, as our compute passes (shaders.c taa_*.comp, which
+// describes each). Post images, at the scene's size unless said:
+//   16 nearest depth / vector per pixel (RGBA32F); 17 / 18 luma (this frame's and last frame's, in turn); 19 this
+//   frame's nearest depths where they were last frame (R32 uint, cleared to +inf); 20-22 the shading change's
+//   differences at half, quarter and eighth size, 23 the shading change (half size); 24 reactive, disocclusion,
+//   shading change, accumulation (RGBA8); 25 / 26 the accumulation (in turn); 27 new thin-feature locks; 28 / 29 the
+//   last 4 lumas (in turn); 30 luma instability; 11 / 12 the history (RGB, lock: in turn); 31 the output (RGB, the
+//   scene's alpha), RGBA16F, which FSR 1 and CAS take from there.
+// The history starts over when a frame was not blended (TAA off, a frame without the scene) or the size changed.
+// NULL when the vectors or the depth aren't the scene's size, or there is no camera yet.
 static TexBackend *mvec_taa(VkCommandBuffer cb, TexBackend *b, uint64_t frame) {
-    if (!mvec_vectors_img || mvec_vectors_img->width != b->width || mvec_vectors_img->height != b->height) return NULL;
+    TexBackend *db = mvec_depth ? vk_tex(mvec_depth, false) : NULL;
+    uint32_t w = b->width, h = b->height;
+    if (!mvec_vectors_img || mvec_vectors_img->width != w || mvec_vectors_img->height != h || !db || !db->image ||
+        db->width != w || db->height != h)
+        return NULL;
+    if (!g_vk.storage_ext) {  // (the R8 / R16F / RG16F storage images: every desktop and handheld GPU has them)
+        static bool logged;
+        if (!logged) LOG("[taa] unavailable: the device lacks shaderStorageImageExtendedFormats\n");
+        logged = true;
+        return NULL;
+    }
+    float jit[2], nr, fr, fov;
+    if (!mvec_camera_now(jit, &nr, &fr, &fov)) return NULL;
     static uint64_t last = ~0ull;
+    static uint32_t lw, lh;
     static int n;
-    TexBackend *hist = post_image(11 + n, b->width, b->height, VK_FORMAT_R16G16B16A16_SFLOAT);
-    bool valid = last != ~0ull && last + 1 == frame;
+    static float pj[2];
+    bool valid = last != ~0ull && last + 1 == frame && w == lw && h == lh;
+    int c = n, p = n ^ 1;  // (this frame's half of each pair, last frame's)
     n ^= 1;
-    TexBackend *out = post_image(11 + n, b->width, b->height, VK_FORMAT_R16G16B16A16_SFLOAT);
+    const VkImageUsageFlags S = VK_IMAGE_USAGE_STORAGE_BIT;
+    const VkFormat F16 = VK_FORMAT_R16G16B16A16_SFLOAT, R8 = VK_FORMAT_R8_UNORM;
+    uint32_t w2 = (w + 1) / 2, h2 = (h + 1) / 2, w4 = (w2 + 1) / 2, h4 = (h2 + 1) / 2, w8 = (w4 + 1) / 2, h8 = (h4 + 1) / 2;
+    TexBackend *dil = post_image_ex(16, w, h, VK_FORMAT_R32G32B32A32_SFLOAT, S);
+    TexBackend *luma[2] = {post_image_ex(17, w, h, VK_FORMAT_R16_SFLOAT, S), post_image_ex(18, w, h, VK_FORMAT_R16_SFLOAT, S)};
+    TexBackend *recon = post_image_ex(19, w, h, VK_FORMAT_R32_UINT, S | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    TexBackend *sh[3] = {post_image_ex(20, w2, h2, VK_FORMAT_R16G16_SFLOAT, S), post_image_ex(21, w4, h4, VK_FORMAT_R16G16_SFLOAT, S),
+                         post_image_ex(22, w8, h8, VK_FORMAT_R16G16_SFLOAT, S)};
+    TexBackend *shade = post_image_ex(23, w2, h2, R8, S);
+    TexBackend *react = post_image_ex(24, w, h, VK_FORMAT_R8G8B8A8_UNORM, S);
+    TexBackend *acc[2] = {post_image_ex(25, w, h, R8, S), post_image_ex(26, w, h, R8, S)};
+    TexBackend *lock = post_image_ex(27, w, h, R8, S);
+    TexBackend *lumah[2] = {post_image_ex(28, w, h, F16, S), post_image_ex(29, w, h, F16, S)};
+    TexBackend *instab = post_image_ex(30, w, h, R8, S);
+    TexBackend *hist[2] = {post_image_ex(11, w, h, F16, S), post_image_ex(12, w, h, F16, S)};
+    TexBackend *out = post_image_ex(31, w, h, F16, S);
     static const VkComponentMapping id = {0};
-    VkImageView in[3] = {vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT),
-                         post_view(hist), post_view(mvec_vectors_img)};
-    float jit[2] = {0, 0}, nr, fr, fov;
-    mvec_camera_now(jit, &nr, &fr, &fov);
+    VkImageView color = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageView depth = vk_image_view(db, VK_IMAGE_VIEW_TYPE_2D, db->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
+    VkImageView vec = post_view(mvec_vectors_img);
     float flip = nvn_window_origin() == 0 ? -1.0f : 1.0f;
-    float pc[8] = {valid ? 1.0f : 0.0f, 0.1f, 0, 0, (float)b->width, (float)b->height,  // (0.1: the new frame's share)
-                   jit[0] * (float)b->width * 0.5f, -jit[1] * flip * (float)b->height * 0.5f};  // (the jitter as fsr3_scene's)
-    post_pass_pc(cb, "taa.frag", in, 3, out, pc, sizeof pc, false);
+    float J[2] = {jit[0] * (float)w * 0.5f, -jit[1] * flip * (float)h * 0.5f};  // (render pixels, y down)
+    double dn = nr, df = fr;  // (view depth from the window's: the projection's z row, OpenGL style)
+    float A = (float)(-(df + dn) / (df - dn)), B = (float)(-2.0 * df * dn / (df - dn));
+    bool gl = nvn_depth_mode() == 0;  // (depth -1..1 in clip space: the window's 0..1 is twice that, minus 1)
+    float pc[16] = {(float)w, (float)h, 1.0f / (float)w, 1.0f / (float)h, J[0], J[1], valid ? pj[0] : J[0], valid ? pj[1] : J[1],
+                    A, B, gl ? 2.0f : 1.0f, gl ? -1.0f : 0.0f, valid ? 1.0f : 0.0f, 8.0f, 0, 0};
     vk_full_barrier(cb);
+    VkClearColorValue inf = {.uint32 = {0x7F800000u, 0, 0, 0}};
+    VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, recon->image, VK_IMAGE_LAYOUT_GENERAL, &inf, 1, &rr);
+    {
+        VkImageView in[] = {color, vec, depth};
+        TexBackend *o[] = {dil, luma[c], recon};
+        cpost_pass(cb, "taa_prepare.comp", in, 3, o, 3, pc, w, h);
+    }
+    {
+        pc[14] = (float)w2, pc[15] = (float)h2;
+        VkImageView in[] = {post_view(dil), post_view(luma[c]), post_view(luma[p])};
+        cpost_pass(cb, "taa_shade_src.comp", in, 3, &sh[0], 1, pc, w2, h2);
+        pc[14] = (float)w4, pc[15] = (float)h4;
+        VkImageView i1[] = {post_view(sh[0])};
+        cpost_pass(cb, "taa_shade_down.comp", i1, 1, &sh[1], 1, pc, w4, h4);
+        pc[14] = (float)w8, pc[15] = (float)h8;
+        VkImageView i2[] = {post_view(sh[1])};
+        cpost_pass(cb, "taa_shade_down.comp", i2, 1, &sh[2], 1, pc, w8, h8);
+        pc[14] = (float)w2, pc[15] = (float)h2;
+        VkImageView i3[] = {post_view(sh[0]), post_view(sh[1]), post_view(sh[2])};
+        cpost_pass(cb, "taa_shade.comp", i3, 3, &shade, 1, pc, w2, h2);
+        pc[14] = pc[15] = 0;
+    }
+    {
+        VkImageView in[] = {post_view(dil), vec, post_view(acc[p]), post_view(shade), post_view(luma[c])};
+        TexBackend *o[] = {recon, react, acc[c], lock};
+        cpost_pass(cb, "taa_reactivity.comp", in, 5, o, 4, pc, w, h);
+    }
+    {
+        VkImageView in[] = {post_view(dil), post_view(react), post_view(luma[c]), post_view(lumah[p])};
+        TexBackend *o[] = {lumah[c], instab};
+        cpost_pass(cb, "taa_instability.comp", in, 4, o, 2, pc, w, h);
+    }
+    {
+        // (testing) SAVAGEWIND_TAA_VIEW=<frame>:<1-7>,... (ascending): a mask over the image from that frame on
+        // (shaders.c taa_resolve; 0: none)
+        static const char *view_next = (const char *)1;
+        static int view;
+        if (view_next == (const char *)1) view_next = getenv("SAVAGEWIND_TAA_VIEW");
+        while (view_next && *view_next) {
+            char *e;
+            unsigned long long at = strtoull(view_next, &e, 10);
+            if (frame < at || *e != ':') break;
+            view = (int)strtol(e + 1, &e, 10);
+            view_next = *e == ',' ? e + 1 : NULL;
+        }
+        pc[14] = (float)view;
+        VkImageView in[] = {color, post_view(dil), post_view(react), post_view(instab), post_view(hist[p]), post_view(lock)};
+        TexBackend *o[] = {hist[c], out};
+        cpost_pass(cb, "taa_resolve.comp", in, 6, o, 2, pc, w, h);
+    }
+    vk_full_barrier(cb);
+    gp_mark(cb, "post taa end");
     last = frame;
+    lw = w, lh = h;
+    pj[0] = J[0], pj[1] = J[1];
     return out;
 }
 

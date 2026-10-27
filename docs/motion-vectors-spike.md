@@ -151,6 +151,37 @@ minus this one, x4) and the jitter off (`SAVAGEWIND_JITTER=0`), so only vector e
 - **Shader compiles:** the motion variants go into the precompile key log like any other; with the cache warm, a TAA
   run compiles nothing in play and world entry peaks at 67-108 ms (75-191 without TAA).
 
+## TAA: FSR 3.1's temporal reconstruction at 1x
+
+The first TAA (one fragment pass: Catmull-Rom history in a fixed 1.25 sigma YCoCg box, one blend weight for every
+pixel) flickered on foliage at about twice AMD FSR 3's rate. It is now the reconstruction of FSR 3.1's upscaler
+(the vendored SDK's shaders were the reference, not copied), at the scene's own size, as seven compute passes
+(`shaders.c` `taa_*.comp`, `exec.c` `mvec_taa`):
+
+- **Dilation:** each pixel's vector and depth are the nearest surface's in its 3x3, so silhouettes move with the
+  foreground.
+- **Disocclusion from depth:** this frame's nearest depths are scattered (atomic min) to where they were last frame;
+  a surface behind what landed in its place was hidden. No previous depth buffer is kept.
+- **Per-pixel accumulation:** 1/3 more a frame, 0 on a shading change, two frames of the new image alone after a
+  disocclusion. The blend is the new sample's own weight (how close its jittered samples fall to the pixel) against
+  it: about 1/23 on a converged still pixel.
+- **Shading change:** this frame's 5-luma neighbourhood against last frame's as sorted sets (jitter and sub-pixel
+  motion reorder values but don't change them), over three sizes.
+- **Anti-flicker:** a pixel whose luma matches an older frame better than the last one (it oscillates with the
+  jitter) and thin features (luma ridges filling no 2x2 quadrant) keep their history from the clamp.
+- **Clamp:** an ellipsoid around the 3x3's Gaussian mean, 1-3 standard deviations by confidence, motion and distance.
+- **Around it:** the game's own textures in the jittered passes get a -1 mip bias (`log2(render / output) - 1` under
+  an upscaler); Video > Sharpening is RCAS after TAA, as under FSR 3 (CAS sharpened the residual flicker up); the
+  jitter steps once per presented frame (paused, the game updates twice a frame and only half the phases were used).
+
+Measured at 4K on an RTX 3080 Ti, still view, flicker (temporal second difference of luma, 75th percentile of the
+region) against AMD's own FSR 3 at the window's size (the same algorithm in AMD's code: the FSR 3 upscaler that builds
+on this, with its `fsr3-native` test mode) in the same run, interleaved: trees 0.23-0.29 against 0.27-0.30, grass
+0.40-0.47 against 0.39-0.48, far field 0.23-0.25 against 0.23-0.25. GPU time 2.0 ms a frame (FSR 3 native: 2.3), plus
+0.09 ms of RCAS; the old TAA was 0.6.
+`SAVAGEWIND_TAA_VIEW=<frame>:<1-7>` shows its masks (disocclusion, accumulation, shading change, instability, locks,
+motion divergence, no vector); `SAVAGEWIND_MIP_BIAS=<levels>` replaces the bias.
+
 ## Reproducing
 
 The instrumentation (`SAVAGEWIND_MV_SPIKE=1`, `[mv]` log lines) was a throwaway commit, not part of this branch: the

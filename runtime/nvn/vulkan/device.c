@@ -387,6 +387,8 @@ static void create_device(void) {
     b->fillModeNonSolid = h->fillModeNonSolid;
     b->samplerAnisotropy = h->samplerAnisotropy;
     g_vk.feat_aniso = h->samplerAnisotropy;
+    b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
+    g_vk.storage_ext = h->shaderStorageImageExtendedFormats;
     b->textureCompressionBC = h->textureCompressionBC;
     b->shaderInt64 = h->shaderInt64;
     b->depthBiasClamp = h->depthBiasClamp;
