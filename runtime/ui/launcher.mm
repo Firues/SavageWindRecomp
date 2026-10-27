@@ -518,7 +518,14 @@ static bool setup_dlc(std::vector<std::string> dlc) {
     for (size_t i = 0; i < by_files.size() && (int)i < DLC_MAX; i++) {
         const std::string &d = by_files[i].second, n = aoc_name(AOC_DIR, (int)i + 1);
         struct stat sb;
-        if (!lstat((g_root + "/" + n).c_str(), &sb)) {  // (still there: a link, left alone - never copied into)
+#ifdef _WIN32
+        // mingw-w64 has no lstat at all (paths.c's is behind #else): stat is the closest - it follows a link, which
+        // only differs for a dangling one
+        const bool in_the_way = stat((g_root + "/" + n).c_str(), &sb) == 0;
+#else
+        const bool in_the_way = lstat((g_root + "/" + n).c_str(), &sb) == 0;
+#endif
+        if (in_the_way) {  // (still there: a link, left alone - never copied into)
             fprintf(stderr, "[launcher] DLC: %s/%s is in the way (a link?)\n", g_root.c_str(), n.c_str());
             return false;
         }

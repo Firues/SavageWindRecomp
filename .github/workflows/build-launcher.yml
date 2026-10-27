@@ -111,7 +111,14 @@ jobs:
           key: deps-win-${{ hashFiles('tools/build_deps_windows.sh') }}
 
       - name: Build LGPL FFmpeg (make deps-windows)
-        run: bash tools/build_deps_windows.sh
+        run: |
+          # ffmpeg.org изредка недоступен с раннера: три попытки, скрипт продолжает с того же места.
+          for i in 1 2 3; do
+            if bash tools/build_deps_windows.sh; then exit 0; fi
+            echo "::warning::deps-windows attempt $i failed, retrying"
+            sleep 20
+          done
+          exit 1
 
       - name: Build launcher
         run: >-
