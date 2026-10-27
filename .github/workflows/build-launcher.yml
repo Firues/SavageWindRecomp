@@ -1,0 +1,134 @@
+# Сборка лаунчера Savage Wind на раннере GitHub (только приложение, без кода игры).
+# Положить в свой форк по пути .github/workflows/build-launcher.yml
+#
+# Два задания:
+#   quick   — обычный `make -j`, как у разработчика в MSYS2. Быстро (~3-6 мин), но exe консольный
+#             и линкуется с GPL-FFmpeg из MSYS2: запускать только из MSYS2-шелла с PATH.
+#   release — то же, что делает `make dist`: LGPL-FFmpeg 9.0.2 из tools/build_deps_windows.sh,
+#             RELEASE=1 (без консольного окна). Такой exe - прямая замена файлов в официальном
+#             релизном zip. Первый прогон дольше (собирает FFmpeg), дальше берётся из кеша.
+#
+# Игровые файлы тут не нужны и не используются: generated/ отсутствует, поэтому make собирает
+# только оболочку. Код игры по-прежнему компилируется на вашем ПК при первом запуске.
+
+name: Build launcher (Windows)
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quick:
+    name: Quick (MSYS2, console build)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-spirv-tools
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Collect
+        run: |
+          mkdir -p out/quick
+          cp build/savagewind.exe build/savagewind-config.exe build/savagewind.dll.a out/quick/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: savagewind-quick
+          path: out/quick
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Release-style (LGPL FFmpeg, no console)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-spirv-tools
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-zlib
+
+      # FFmpeg 9.0.2 (LGPL) собирается один раз на версию скрипта, дальше берётся из кеша.
+      # Кешируем результат, а не дерево сборки: скрипт пропускает сборку, если на месте lib/libavcodec.dll.a.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            build/deps-win/lib
+            build/deps-win/bin
+            build/deps-win/include
+            build/deps-win/src/ffmpeg-9.0.2.tar.xz
+          key: deps-win-${{ hashFiles('tools/build_deps_windows.sh') }}
+
+      - name: Build LGPL FFmpeg (make deps-windows)
+        run: bash tools/build_deps_windows.sh
+
+      - name: Build launcher
+        run: >-
+          make -j$(nproc) B=build/win-release DEPS="$PWD/build/deps-win" RELEASE=1
+          build/win-release/savagewind.exe
+          build/win-release/savagewind-config.exe
+
+      - name: Collect
+        run: |
+          mkdir -p out/release
+          cp build/win-release/savagewind.exe build/win-release/savagewind.dll.a out/release/
+          cp build/win-release/savagewind-config.exe "out/release/Savage Wind Configuration.exe"
+          ls -l out/release
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: savagewind-release
+          path: out/release
+          if-no-files-found: error
+          retention-days: 30
