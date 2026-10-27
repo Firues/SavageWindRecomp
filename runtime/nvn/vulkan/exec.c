@@ -3688,12 +3688,13 @@ static bool aniso_all(void) {
     return at && renderer_present_count() >= (uint64_t)at;
 }
 
-// Texture LOD bias for the jittered scene (TAA: set by scene_post): log2(render size / output size) - 1, the temporal
-// pass resolving the detail a lower mip level would have averaged away (AMD's guidance for temporal upscalers; -1 at
-// the scene's own size). The game's own textures (uploaded, not drawn: materials, terrain, foliage) in the fragment
-// stage of the passes that get the motion target only. Not what the GPU draws or computes: the deferred lighting in
-// those passes reads mip chains the game made itself (the scene's luminance for the exposure, probes) at exact levels,
-// and a level off there lit every surface white. Nor the vertex stage's terrain and grass lookups, shadows, the HUD.
+// Texture LOD bias for the jittered scene (TAA, FSR 3: set by scene_post): log2(render size / output size) - 1, the
+// temporal pass resolving the detail a lower mip level would have averaged away (AMD's guidance for temporal
+// upscalers; -1 at the scene's own size, -1.58 at FSR 3 Quality). The game's own textures (uploaded, not drawn:
+// materials, terrain, foliage) in the fragment stage of the passes that get the motion target only. Not what the GPU
+// draws or computes: the deferred lighting in those passes reads mip chains the game made itself (the scene's
+// luminance for the exposure, probes) at exact levels, and a level off there lit every surface white. Nor the vertex
+// stage's terrain and grass lookups, shadows, the HUD.
 static float scene_mip_bias;
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
@@ -6093,10 +6094,10 @@ static void scene_post(Prog *pr, CmdRec *r) {
         // (else at its size in the window already; FSR 3: FSR 1 for a frame it can't do, its first)
         bool up = (fsr || fsr3) && (ow > b->width + 1 || oh > b->height + 1);
         if (t != taa_t) taa = NULL;
-        scene_mip_bias = taa && ow && b->width ? log2f((float)b->width / (float)ow) - 1.0f : 0.0f;
+        scene_mip_bias = (taa || fsr3) && ow && b->width ? log2f((float)b->width / (float)ow) - 1.0f : 0.0f;
         static const char *bias_env = (const char *)1;  // (testing) SAVAGEWIND_MIP_BIAS=<levels>: in place of that
         if (bias_env == (const char *)1) bias_env = getenv("SAVAGEWIND_MIP_BIAS");
-        if (bias_env && taa) scene_mip_bias = (float)atof(bias_env);
+        if (bias_env && (taa || fsr3)) scene_mip_bias = (float)atof(bias_env);
         if (!up && !cas && !taa && !fsr3) return;
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
