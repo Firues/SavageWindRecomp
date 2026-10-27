@@ -71,7 +71,7 @@ static struct {  // since the last log line
     uint64_t loose;   // matched by shaders and vertex buffers (prev_match_loose)
     uint64_t frames, draws, matched, repeated, unmatched, dropped, cb_bytes, inst_bytes, copied, dedupe_hits, max_used, motion,
         cameras;    // frames with a valid camera (camera_finish)
-} stat;
+} mstat;
 // The frame's slot-3 copies by guest address (the camera block: the one most draws read, camera_finish)
 #define CAMC 32
 static struct { uint64_t addr; uint32_t off, size, n; } camc[CAMC];
@@ -182,7 +182,7 @@ static bool camera_compute(Slot *s, MvecCamera *c) {
 
 // The finished frame's camera (when the next frame begins)
 static void camera_finish(Slot *s) {
-    if (camera_compute(s, &s->cam)) stat.cameras++;
+    if (camera_compute(s, &s->cam)) mstat.cameras++;
     ncamc = 0;
 }
 
@@ -233,26 +233,26 @@ static int log_every(void) {
 }
 static void log_stats(uint64_t frame) {
     int every = log_every();
-    if (every <= 0 || ++stat.frames < (uint64_t)every) return;
-    double f = (double)stat.frames;
+    if (every <= 0 || ++mstat.frames < (uint64_t)every) return;
+    double f = (double)mstat.frames;
     LOG("[mvec] frame %llu: %.0f scene draws a frame, matched %.1f%% (%.0f with a repeated key, %.1f%% drawn with motion), "
         "unmatched %.0f, %.0f matched without their index buffer, "
         "not recorded %.0f; inputs %.0f KB constants + %.0f KB instance data a frame, %.0f KB copied (%.0f copies "
         "shared); history slot at most %.1f MB used of %.1f; camera found in %.0f%% of the frames; %.1f effects a frame in "
         "the reactive mask\n",
-        (unsigned long long)frame, stat.draws / f, stat.draws ? 100.0 * stat.matched / stat.draws : 0.0, stat.repeated / f,
-        stat.draws ? 100.0 * stat.motion / stat.draws : 0.0, stat.unmatched / f, stat.loose / f, stat.dropped / f, stat.cb_bytes / f / 1024, stat.inst_bytes / f / 1024, stat.copied / f / 1024,
-        stat.dedupe_hits / f, stat.max_used / 1048576.0, cur >= 0 ? slots[cur].cap / 1048576.0 : 0.0,
-        100.0 * stat.cameras / f, stat.masked / f);
+        (unsigned long long)frame, mstat.draws / f, mstat.draws ? 100.0 * mstat.matched / mstat.draws : 0.0, mstat.repeated / f,
+        mstat.draws ? 100.0 * mstat.motion / mstat.draws : 0.0, mstat.unmatched / f, mstat.loose / f, mstat.dropped / f, mstat.cb_bytes / f / 1024, mstat.inst_bytes / f / 1024, mstat.copied / f / 1024,
+        mstat.dedupe_hits / f, mstat.max_used / 1048576.0, cur >= 0 ? slots[cur].cap / 1048576.0 : 0.0,
+        100.0 * mstat.cameras / f, mstat.masked / f);
     for (int g = 0; g < 2; g++)
         LOG("[mvec]   fingerprint distances, keys with %s: %.0f < 1e-4, %.0f < 1e-3, %.0f < 0.01, %.0f < 0.05, %.0f < 0.2, "
-            "%.0f more%s", g ? "several candidates" : "one candidate", stat.dist_hist[g][0] / f, stat.dist_hist[g][1] / f,
-            stat.dist_hist[g][2] / f, stat.dist_hist[g][3] / f, stat.dist_hist[g][4] / f, stat.dist_hist[g][5] / f,
+            "%.0f more%s", g ? "several candidates" : "one candidate", mstat.dist_hist[g][0] / f, mstat.dist_hist[g][1] / f,
+            mstat.dist_hist[g][2] / f, mstat.dist_hist[g][3] / f, mstat.dist_hist[g][4] / f, mstat.dist_hist[g][5] / f,
             g ? "" : "\n");
-    LOG("; %.0f a frame matched differently than by draw order\n", stat.not_ordinal / f);
+    LOG("; %.0f a frame matched differently than by draw order\n", mstat.not_ordinal / f);
     LOG("[mvec]   of %.0f draws with a world matrix, moved > 1 cm: %.1f matched by fingerprint (%.1f by draw order)\n",
-        stat.moved_checked / f, stat.moved_fp / f, stat.moved_order / f);
-    memset(&stat, 0, sizeof stat);
+        mstat.moved_checked / f, mstat.moved_fp / f, mstat.moved_order / f);
+    memset(&mstat, 0, sizeof mstat);
 }
 
 static const Slot *sort_prev;  // (cmp_by_key's records)
@@ -273,7 +273,7 @@ static int32_t prev_match(MvecRec *r);
 static void frame_begin(uint64_t frame) {
     if (cur >= 0) camera_finish(&slots[cur]);
     if (cur >= 0) {
-        if (slots[cur].used > stat.max_used) stat.max_used = slots[cur].used;
+        if (slots[cur].used > mstat.max_used) mstat.max_used = slots[cur].used;
         log_stats(frame);
     }
     int last = cur;
@@ -358,14 +358,14 @@ static int32_t prev_match(MvecRec *r) {
     if (best < 0) return -1;
     static float limit = -1;  // SAVAGEWIND_MVEC_MATCH_LIMIT: the largest fingerprint distance of a match (default 0.2)
     if (limit < 0) limit = getenv("SAVAGEWIND_MVEC_MATCH_LIMIT") ? (float)atof(getenv("SAVAGEWIND_MVEC_MATCH_LIMIT")) : 0.2f;
-    if (bd >= limit) { stat.dist_hist[ncand > 1][5]++; return -1; }  // (a new object: the camera's vector)
+    if (bd >= limit) { mstat.dist_hist[ncand > 1][5]++; return -1; }  // (a new object: the camera's vector)
     ptaken[best] = true;
     rtaken[pidx[best]] = true;
     r->dist = bd;
     static const float edges[5] = {1e-4f, 1e-3f, 0.01f, 0.05f, 0.2f};
     int bucket = 0;
     while (bucket < 5 && bd >= edges[bucket]) bucket++;
-    stat.dist_hist[ncand > 1][bucket]++;
+    mstat.dist_hist[ncand > 1][bucket]++;
     return pidx[best];
 }
 
@@ -388,7 +388,7 @@ static int32_t prev_match_loose(MvecRec *r) {
     if (best < 0) return -1;
     rtaken[pidx2[best]] = true;
     r->dist = bd;
-    stat.loose++;
+    mstat.loose++;
     return pidx2[best];
 }
 
@@ -414,7 +414,7 @@ static uint32_t copy_in(uint64_t addr, uint64_t size, uint64_t gen, bool share) 
     Slot *s = &slots[cur];
     uint32_t h = (uint32_t)(mix(mix(addr, size), gen) >> 40) & (DEDUPE - 1);
     if (share && dedupe[h].addr == addr && dedupe[h].size == size && dedupe[h].gen == gen) {
-        stat.dedupe_hits++;
+        mstat.dedupe_hits++;
         return dedupe[h].off;
     }
     uint64_t align = g_vk.props.limits.minUniformBufferOffsetAlignment;
@@ -427,7 +427,7 @@ static uint32_t copy_in(uint64_t addr, uint64_t size, uint64_t gen, bool share) 
         return UINT32_MAX;
     }
     memcpy(s->ptr + off, (const void *)(uintptr_t)addr, size);
-    stat.copied += size;
+    mstat.copied += size;
     s->used = off + size;
     if (share) dedupe[h] = (Dedupe){addr, size, gen, (uint32_t)off};
     return (uint32_t)off;
@@ -437,8 +437,8 @@ int mvec_record(const MvecDrawIn *d) {
     if (!mvec_enabled()) return -1;
     if (d->frame != cur_frame) frame_begin(d->frame);
     Slot *s = &slots[cur];
-    stat.draws++;
-    if (s->full) { stat.dropped++; return -1; }
+    mstat.draws++;
+    if (s->full) { mstat.dropped++; return -1; }
     if (s->nrec == s->cap_rec) {
         s->cap_rec = s->cap_rec ? s->cap_rec * 2 : 4096;
         s->rec = realloc(s->rec, (size_t)s->cap_rec * sizeof *s->rec);
@@ -462,7 +462,7 @@ int mvec_record(const MvecDrawIn *d) {
         r->inst_stream[r->ninst] = (uint8_t)i;
         r->inst_off[r->ninst] = off;
         r->inst_size[r->ninst++] = (uint32_t)size;
-        stat.inst_bytes += size;
+        mstat.inst_bytes += size;
     }
     for (int k = 0; k < d->ncb && r->ncb < MVEC_CB; k++) {
         if (!d->cb[k].addr || !d->cb[k].size) continue;
@@ -477,7 +477,7 @@ int mvec_record(const MvecDrawIn *d) {
         r->cb_slot[r->ncb] = d->cb[k].slot;
         r->cb_off[r->ncb] = off;
         r->cb_size[r->ncb++] = (uint32_t)d->cb[k].size;
-        stat.cb_bytes += d->cb[k].size;
+        mstat.cb_bytes += d->cb[k].size;
     }
     // the fingerprint, from guest memory as it is now; not from the camera block (slot 3), which the scene's draws share:
     // it tells no draw apart, and as the camera moves no draw's fingerprint was equal to its match's any more, so the
@@ -499,30 +499,30 @@ int mvec_record(const MvecDrawIn *d) {
     if (log_every() > 0) {  // (statistics) the object's world position (slot 4's translation) against each matching's previous draw
         int32_t po = prev_lookup(key, r->ord), pf = by_order ? -1 : r->prev;
         if (r->nfeat >= 12 && r->cb_slot[0] == 3 && r->cb_slot[1] == 4 && po >= 0 && pf >= 0) {
-            stat.moved_checked++;
+            mstat.moved_checked++;
             const float *t = &r->feat[0];
             for (int m = 0; m < 2; m++) {
                 const MvecRec *q = &slots[prev].rec[m ? pf : po];
                 if (q->nfeat < 12) continue;
                 float dx = t[3] - q->feat[3], dy = t[7] - q->feat[7], dz = t[11] - q->feat[11];
-                if (dx * dx + dy * dy + dz * dz > 1e-4f) { if (m) stat.moved_fp++; else stat.moved_order++; }
+                if (dx * dx + dy * dy + dz * dz > 1e-4f) { if (m) mstat.moved_fp++; else mstat.moved_order++; }
             }
         }
     }
-    if (log_every() > 0 && r->prev >= 0 && r->prev != prev_lookup(key, r->ord)) stat.not_ordinal++;
-    if (r->ord) stat.repeated++;
-    if (r->prev >= 0) stat.matched++;
-    else stat.unmatched++;
+    if (log_every() > 0 && r->prev >= 0 && r->prev != prev_lookup(key, r->ord)) mstat.not_ordinal++;
+    if (r->ord) mstat.repeated++;
+    if (r->prev >= 0) mstat.matched++;
+    else mstat.unmatched++;
     s->seq = vk_pending_seq();
     return s->nrec++;
 full:
     s->used = used_before;
-    stat.dropped++;
+    mstat.dropped++;
     return -1;
 }
 
-void mvec_drawn(void) { stat.motion++; }
-void mvec_masked(void) { stat.masked++; }
+void mvec_drawn(void) { mstat.motion++; }
+void mvec_masked(void) { mstat.masked++; }
 
 bool mvec_push(int rec, uint32_t pc[MVEC_PUSH / 4]) {
     if (cur < 0 || prev < 0 || rec < 0 || rec >= slots[cur].nrec) return false;
