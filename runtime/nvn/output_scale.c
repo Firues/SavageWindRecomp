@@ -244,8 +244,9 @@ void rt_frustum(uint64_t proj, float *f) {
 }
 
 // Temporal anti-aliasing / upscaling jitter (Video > Anti-aliasing TAA; SAVAGEWIND_JITTER=1 / 0 whatever the setting): the world camera's projection moved by a sub-pixel
-// offset, a Halton (2, 3) sequence over 8 game frames (framepace_game_frame: every matrix made in one frame gets the
-// same), [-0.5, 0.5] pixels of the scene's render size (rt_jitter_set_size). It lands in the projection of the frame's
+// offset, a Halton (2, 3) sequence over 8 presented frames (framepace_shown_frame: every matrix made in one frame gets
+// the same, and the paused game's two updates a frame one phase), [-0.5, 0.5] pixels of the scene's render size
+// (rt_jitter_set_size). It lands in the projection of the frame's
 // camera block, where vulkan/mvec.c reads it back and takes it out of the motion vectors.
 static uint32_t jitter_size[2];
 void rt_jitter_set_size(uint32_t w, uint32_t h) {
@@ -300,7 +301,7 @@ void rt_persp_offset(uint64_t proj, uint32_t *x, uint32_t *y) {
     if (shape != 1 && fabsf(a - 16.0f / 9.0f) < 0.01f) ox /= shape;
     uint32_t w = __atomic_load_n(&jitter_size[0], __ATOMIC_RELAXED), h = __atomic_load_n(&jitter_size[1], __ATOMIC_RELAXED);
     if (nf[1] > 10001 && rt_jitter_on() && w && h) {
-        uint32_t i = (uint32_t)(framepace_game_frame() % 8) + 1;  // (from 1: Halton's 0 is 0)
+        uint32_t i = (uint32_t)(framepace_shown_frame() % 8) + 1;  // (from 1: Halton's 0 is 0)
         ox += (halton(i, 2) - 0.5f) / (float)w;
         oy += (halton(i, 3) - 0.5f) / (float)h;  // (the projection gets twice the offset: NDC is 2 wide)
     }
