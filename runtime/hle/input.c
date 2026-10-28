@@ -46,7 +46,10 @@ extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or n
 
 static bool pc_gyro_enabled(void) {
     static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_PC_GYRO") && atoi(getenv("SAVAGEWIND_PC_GYRO"));
+    if (on < 0) {
+        const char *v = getenv("SAVAGEWIND_PC_GYRO");
+        on = v ? atoi(v) != 0 : 1;
+    }
     return on;
 }
 

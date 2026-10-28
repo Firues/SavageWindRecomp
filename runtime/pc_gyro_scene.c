@@ -18,7 +18,7 @@ static uint64_t last_actor_ns;
 static bool paused_before;
 static bool enabled(void) {
     const char *v=getenv("SAVAGEWIND_GYRO_SCENE");
-    return v && atoi(v) && g_game_version && !strcmp(g_game_version,"1.9.0");
+    return (!v || atoi(v)) && g_game_version && !strcmp(g_game_version,"1.9.0");
 }
 static bool ptr(uint64_t p){return p>=GUEST_LO && p<GUEST_HI-0x1000;}
 // Native apparatus activation owns input; no model projection is involved.

@@ -17,10 +17,10 @@ int main(void) {
     void *at=(void*)0x7001e10000ull;
 #ifdef _WIN32
     void *mem=VirtualAlloc(at,0x10000,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
-    _putenv_s("SAVAGEWIND_GYRO_SCENE","1");
+    _putenv_s("SAVAGEWIND_GYRO_SCENE","");
 #else
     void *mem=mmap(at,0x10000,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
-    setenv("SAVAGEWIND_GYRO_SCENE","1",1);
+    unsetenv("SAVAGEWIND_GYRO_SCENE");
 #endif
     assert(mem==at);
     g_site.main_end=0x7001e98000ull;g_site.pause_state=0x7001e11000ull;
