@@ -17,6 +17,8 @@
 #include "../settings.h"
 #include "../input_bind.h"
 #include "../motion.h"
+#include "../pc_gyro_scene.h"
+#include "../framepace.h"
 #include "../vibration.h"
 #include "../framepace.h"
 #include "../pc_cursor.h"
@@ -76,9 +78,26 @@ static _Atomic int last_device;  // DEVICE_*: what the player used last
 static bool tilt_held;  // the tilt key: the mouse tilts the controller instead of turning the camera
 extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
 
+static bool pc_gyro_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("SAVAGEWIND_PC_GYRO");
+        on = v ? atoi(v) != 0 : 1;
+    }
+    return on;
+}
+
 static int held_key(int sc) {
     if (sc > BIND_MOUSE && sc <= BIND_MOUSE_LAST) return mouse_down[sc - BIND_MOUSE];
     return sc > 0 && sc < SDL_SCANCODE_COUNT && (keys_down[sc] || test_keys[sc]);
+}
+
+// Retain custom camera bindings; only IJKL are reserved for the virtual sensor.
+static int camera_key(int sc) {
+    if (pc_gyro_enabled() && (sc == SDL_SCANCODE_I || sc == SDL_SCANCODE_J ||
+                              sc == SDL_SCANCODE_K || sc == SDL_SCANCODE_L ||
+                              sc == SDL_SCANCODE_U || sc == SDL_SCANCODE_P)) return 0;
+    return held_key(sc);
 }
 
 // Through the bindings (runtime/hle/bindings.c: g_bind_key), read on every key event, so a rebind applies at once.
@@ -92,8 +111,15 @@ static void recompute_keyboard(void) {
     int tilt = held_key(g_bind_key[BIND_WALK]) ? 13107 : 32767;  // walk: 40% (BOTW walks below about half)
     key_lx = (held_key(g_bind_key[BIND_LS_RIGHT]) - held_key(g_bind_key[BIND_LS_LEFT])) * tilt;
     key_ly = (held_key(g_bind_key[BIND_LS_UP]) - held_key(g_bind_key[BIND_LS_DOWN])) * tilt;
-    key_rx = (held_key(g_bind_key[BIND_RS_RIGHT]) - held_key(g_bind_key[BIND_RS_LEFT])) * 32767;
-    key_ry = (held_key(g_bind_key[BIND_RS_UP]) - held_key(g_bind_key[BIND_RS_DOWN])) * 32767;
+    key_rx = (camera_key(g_bind_key[BIND_RS_RIGHT]) - camera_key(g_bind_key[BIND_RS_LEFT])) * 32767;
+    key_ry = (camera_key(g_bind_key[BIND_RS_UP]) - camera_key(g_bind_key[BIND_RS_DOWN])) * 32767;
+    if (pc_gyro_enabled()) {
+        bool allow = !menu_input_captured() && !framepace_menu_ui() && !framepace_title_ui();
+        motion_keyboard(allow ? held_key(SDL_SCANCODE_K) - held_key(SDL_SCANCODE_I) : 0,
+                        allow ? held_key(SDL_SCANCODE_L) - held_key(SDL_SCANCODE_J) : 0,
+                        allow ? held_key(SDL_SCANCODE_P) - held_key(SDL_SCANCODE_U) : 0,
+                        allow && held_key(SDL_SCANCODE_O));
+    }
     bool tilt_key = held_key(g_bind_key[BIND_TILT]) && !menu_input_captured();
     if (tilt_key != tilt_held) motion_tilt_held(tilt_held = tilt_key);
 }
@@ -202,6 +228,9 @@ void input_cam_frame(float ratio) {
     pc_cursor_frame();
     pc_menu_active = framepace_menu_ui() || framepace_title_ui() || pc_cursor_active();
     if(pc_menu_active)pc_bow_wanted=false;
+    pc_gyro_scene_tick();
+    if (pc_gyro_enabled() && (menu_input_captured() || framepace_menu_ui() || framepace_title_ui()))
+        motion_keyboard(0, 0, 0, false);
     double dx = (double)atomic_exchange(&cam_dx_milli, 0) / 1000.0, dy = (double)atomic_exchange(&cam_dy_milli, 0) / 1000.0;
     if ((dx != 0 || dy != 0) && cam_log_left())
         LOG("[mouse] frame: %.1f %.1f counts, ratio %.3f, held %d/%d\n", dx, dy, ratio, (int)mouse_held, (int)test_mouse);
@@ -431,6 +460,12 @@ void input_handle_event(const SDL_Event *e) {
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         if (e->type == SDL_EVENT_KEY_DOWN) last_device = DEVICE_KEYBOARD;
         recompute_keyboard();
+        break;
+    case SDL_EVENT_MOUSE_WHEEL:
+        if(tilt_held && !menu_input_captured() && !framepace_menu_ui() && !framepace_title_ui()) {
+            float steps=e->wheel.direction==SDL_MOUSEWHEEL_FLIPPED ? -e->wheel.y : e->wheel.y;
+            motion_mouse_yaw(steps);
+        }
         break;
     case SDL_EVENT_MOUSE_MOTION:
         if ((tilt_held || mouse_held) && fabsf(e->motion.xrel) + fabsf(e->motion.yrel) > 4) last_device = DEVICE_KEYBOARD;
